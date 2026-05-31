@@ -10,7 +10,6 @@ Dieses Projekt bietet eine vollautomatische Wetterüberwachung und Teleskopschut
 
 **Hauptfunktionen:**
 - ✅ Automatische Regenüberwachung (Hydreon RG-11)
-- ✅ Windgeschwindigkeits-Überwachung (Davis Anemometer 6410)
 - ✅ Temperatur- und Luftfeuchtigkeits-Überwachung (BME280)
 - ✅ Taupunktberechnung mit Heizungssteuerung
 - ✅ Motorisierte Schutzabdeckung (MG996R Servo)
@@ -26,9 +25,8 @@ Dieses Projekt bietet eine vollautomatische Wetterüberwachung und Teleskopschut
 |------------|--------|----------|
 | Mikrocontroller | ESP32 DevKit | Hauptsteuerung |
 | Regensensor | Hydreon RG-11 | Niederschlagserkennung |
-| Anemometer | Davis 6410 | Windgeschwindigkeit |
 | Umweltsensor | BME280 | Temperatur, Luftfeuchtigkeit, Luftdruck |
-| Servo | MG996R 20kg | Abdeckungsmechanik |
+| Servo | MS24 20kg | Abdeckungsmechanik |
 | GPS-Modul | NEO-6M/7M | Zeitabgleich (optional) |
 | Heizung | 3 Ohm 15W | Taupunkt-Schutz |
 
@@ -117,6 +115,7 @@ Verbinden und WiFi-Zugangsdaten eingeben.
 ## Konfiguration
 
 ### RG-11 Regensensor DIP-Switches
+!!! im Moment nicht funktionsfähig !!!
 
 **Für ASCII "It's Raining" Mode:**
 
@@ -131,15 +130,6 @@ Verbinden und WiFi-Zugangsdaten eingeben.
 
 **Wichtig:** DIP 5 MUSS OFF sein für RS232!
 
-### Davis Anemometer Kalibrierung
-
-Windgeschwindigkeit in km/h:
-```
-V = (1492 / T) * 1.60934
-```
-Wobei T = Zeit zwischen Impulsen in ms
-
-Standard-Schwellwert: **40 km/h**
 
 ### Heizungssteuerung
 
@@ -159,7 +149,7 @@ Das Web-Interface ist erreichbar unter der ESP32-IP:
 
 **Einstellungen:**
 - WiFi-Konfiguration
-- Wind-Schwellwert
+- Wind-Schwellwert  ( nicht integriert )
 - Heizungs-Hysterese
 - Seestar IP-Adresse
 - GPS An/Aus
@@ -168,7 +158,7 @@ Das Web-Interface ist erreichbar unter der ESP32-IP:
 
 ## Servo-Mechanik
 
-Der **MG996R Servo** mit 20kg Drehmoment steuert die Abdeckung:
+Der Servo MS24 mit 20kg Drehmoment steuert die Abdeckung:
 
 - Öffnen: 0° (Reed-Schalter 2)
 - Geschlossen: 90° (Reed-Schalter 1)
@@ -188,11 +178,11 @@ Der **MG996R Servo** mit 20kg Drehmoment steuert die Abdeckung:
 
 ## Seestar S50 Integration
 
-Bei Regen/Wind sendet der ESP32 automatisch:
+Bei Regen/Wind schaltet der Controller das Seestar automatisch ab und schließt die Klappe.
 
-```http
-POST http://SEESTAR_IP/api/v1/telescope/park
-```
+- im Moment nicht funktionsfähig
+
+
 
 Das Teleskop wird geparkt, bevor die Abdeckung schließt.
 
@@ -229,9 +219,7 @@ RG-11 UART initialisiert (RX=35, 9600 Baud, ASCII Mode)
 
 ## Stromversorgung
 
-- ESP32: **5V via USB**
-- Servo: **6V/2A** (separates Netzteil empfohlen)
-- Heizung: **12V/1.5A**
+- 5V 4A externes Netzteil 
 
 **Wichtig:** Servo und ESP32 gemeinsame GND-Verbindung!
 
@@ -242,21 +230,6 @@ RG-11 UART initialisiert (RX=35, 9600 Baud, ASCII Mode)
 - **v2.2** - Slow Register #8 Bucket-Zähler
 - **v0.4** - Heizung auf Innentemperatur, stabile Version
 
-## Troubleshooting
-
-### RG-11 wird nicht erkannt
-- DIP-Switches prüfen (1,2,7 = ON)
-- Pull-Down Widerstand 10kΩ an RX Pin zu GND
-- Serial Monitor checken (115200 Baud)
-
-### Servo bewegt sich nicht
-- Spannungsversorgung prüfen (6V!)
-- GND-Verbindung ESP32 ↔ Servo prüfen
-- Reed-Schalter-Status im Web-Interface checken
-
-### WiFi-Verbindung verloren
-- Reset-Button für AP-Modus (10s halten)
-- Neuverbindung mit SSID: S50-Enclosure-XXXXXX
 
 ## Lizenz
 
@@ -269,9 +242,7 @@ YouTube: [DeltaMike2 Astronomie](https://youtube.com/@DeltaMike2)
 
 ## Danksagungen
 
-- Hydreon für RG-11 Protokoll-Dokumentation
-- Davis Instruments für Anemometer-Specs
-- ZWO für Seestar S50 API
+Allen Irren, die sich das hier antun.
 
 ---
 
