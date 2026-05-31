@@ -8,7 +8,6 @@
 |------------|---------------------|-------|-------------|
 | ESP32 | DevKit V1 (30 Pin) | 1 | AliExpress/Amazon |
 | Regensensor | Hydreon RG-11 | 1 | Hydreon/Conrad |
-| Anemometer | Davis 6410 | 1 | Davis Instruments |
 | Umweltsensor | BME280 (I2C) | 1 | Adafruit/AliExpress |
 | Servo | MG996R 20kg | 1 | Amazon/AliExpress |
 | GPS-Modul | NEO-6M oder NEO-7M | 1 | AliExpress (optional) |
@@ -41,9 +40,8 @@
 
 | Ausgang | Leistung | Verwendung |
 |---------|----------|------------|
-| 5V DC | 2A | ESP32 |
-| 6V DC | 2A | Servo |
-| 12V DC | 2A | Heizung |
+| 5V DC | 4A | Platine |
+
 
 ## Detaillierte Verkabelung
 
@@ -157,13 +155,11 @@ SDA        →   Pin 21 (SDA)
 Servo          Versorgung
 ────────────────────────────
 Braun (GND) →  GND (gemeinsam mit ESP32!)
-Rot (VCC)   →  6V/2A Netzteil
+Rot (VCC)   →  5V/2A Netzteil
 Orange (PWM)→  Pin 13 (ESP32)
 ```
 
-**Wichtig:**
-- **NIEMALS** Servo vom ESP32 5V versorgen!
-- Separates 6V/2A Netzteil verwenden
+
 - GND zwischen ESP32 und Servo-Netzteil verbinden
 
 **Position:**
@@ -264,10 +260,6 @@ RX         →   Pin 17 (GPS_TX)
 - Freie Sicht nach oben (keine Überhänge)
 - Mindestens 30cm von Wänden entfernt
 
-**Davis Anemometer:**
-- Auf höchstem Punkt montieren
-- 2m über Dachfläche empfohlen
-- Freie Windanströmung
 
 **BME280:**
 - Im Gehäuse, aber belüftet
@@ -296,7 +288,7 @@ RX         →   Pin 17 (GPS_TX)
 
 ### Servo ruckt/zittert
 
-1. Separate Stromversorgung 6V/2A prüfen
+1. SStromversorgung 5V/2A prüfen
 2. GND-Verbindung ESP32 ↔ Servo OK?
 3. Kabel zu lang? (max 50cm empfohlen)
 4. Mechanische Blockade?
@@ -306,7 +298,7 @@ RX         →   Pin 17 (GPS_TX)
 1. MOSFET richtig gepolt?
 2. Pull-Down 10kΩ Gate-GND vorhanden?
 3. Freilauf-Diode 1N4007 vorhanden?
-4. 12V Versorgung messen
+4. 5V Versorgung messen
 
 ### BME280 nicht erkannt
 
