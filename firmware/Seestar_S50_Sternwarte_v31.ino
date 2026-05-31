@@ -1,14 +1,14 @@
 /*
- * Seestar S50 enclosure-Steuerung v3.0
+ * Seestar S50 Gehäuse-Steuerung v3.0
  * ESP32 WROOM-32
  * 
  * Features:
  * - WiFi-Manager für einfache WLAN-Konfiguration
  * - Homepage mit Sensordaten, Status und Reed-LEDs
  * - Settings-Seite für Details
- * - Intelligente Open/Close-Logik mit Reed-Checks
- * - RG-11 Rain Sensor (optional, auto-detect)
- * - RTC/GPS Sync mit flüssiger secondsanzeige
+ * - Intelligente Öffnen/Schließen-Logik mit Reed-Checks
+ * - RG-11 Regensensor (optional, auto-detect)
+ * - RTC/GPS Sync mit flüssiger Sekundenanzeige
  * - Optimiertes Sensor-Timing (Wetter 15s, RTC 60s)
  */
 
@@ -26,13 +26,14 @@
 #include <RTClib.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
+#include <driver/uart.h>  // Für uart_set_line_inverse()
 #include <Update.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
 
 // ============= KONFIGURATION =============
 
-#define FIRMWARE_VERSION "0.3"
+#define FIRMWARE_VERSION "3.1"
 
 // GitHub Image URLs
 #define GITHUB_USER "DM2NT"
@@ -40,27 +41,27 @@
 #define GITHUB_BRANCH "main"
 #define IMG_BASE_URL "https://raw.githubusercontent.com/" GITHUB_USER "/" GITHUB_REPO "/" GITHUB_BRANCH "/assets/status_images/"
 
-// Rain Sensor Schwellwert (0 = trocken, 1 = Rain erkannt)
-#define RAIN_THRESHOLD 0.5  // mm/h - Close bei Rain
+// Regensensor Schwellwert (0 = trocken, 1 = Regen erkannt)
+#define RAIN_THRESHOLD 0.5  // mm/h - Schließen bei Regen
 
 // Servo-Geschwindigkeit (ms pro Grad)
 const int servo_speed = 30;
 
 // Sensor Update-Intervalle
-const unsigned long RTC_UPDATE_INTERVAL = 60000;      // 60 seconds
+const unsigned long RTC_UPDATE_INTERVAL = 60000;      // 60 Sekunden
 const unsigned long GPS_SYNC_INTERVAL = 600000;       // 10 Minuten
 
 // Pin-Definitionen
 #define SERVO1_PIN 16  // Taster-Drücker (S50 Ein/Aus)
-#define SERVO2_PIN 17  // Cover
-#define SERVO3_PIN 18  // Lock
+#define SERVO2_PIN 17  // Klappe
+#define SERVO3_PIN 18  // Verriegelung
 
-#define REED1_PIN 25   // Cover closed
-#define REED2_PIN 26   // Lock closed
-#define REED3_PIN 27   // Tube in Standby
+#define REED1_PIN 25   // Klappe geschlossen
+#define REED2_PIN 26   // Verriegelung geschlossen
+#define REED3_PIN 27   // Tubus in Standby
 
 #define RAIN_RX_PIN 35      // RG-11 UART RX
-#define RAIN_TX_PIN 36      // RG-11 UART TX (ungenutzt)
+#define RAIN_TX_PIN 4       // Unbenutzt, aber gültiger Output-Pin
 #define HEATER_PIN 33       // Heizwiderstand 3Ω @ 5V = 8.3W (MOSFET IRLZ44N)
 
 // ============= GLOBALE VARIABLEN =============
@@ -74,33 +75,30 @@ int servo1_pos = 90, servo2_pos = 90, servo3_pos = 90;
 // Servo1 (Taster): 2 Positionen
 int servo1_pos1 = 90, servo1_pos2 = 90;
 
-// Servo2 (Cover): 3 Positionen
+// Servo2 (Klappe): 3 Positionen
 int servo2_pos1 = 90, servo2_pos2 = 90, servo2_pos3 = 90;
 
-// Servo3 (Lock): 2 Positionen
+// Servo3 (Verriegelung): 2 Positionen
 int servo3_pos1 = 90, servo3_pos2 = 90;
 
 // Reed-Status
 bool reed1_state = false, reed2_state = false, reed3_state = false;
-bool reed2_enabled = true;  // Riegelüberwachung activeiert (kann deactiveiert werden)
+bool reed2_enabled = true;  // Riegelüberwachung aktiviert (kann deaktiviert werden)
 
-// Rain Sensor RG-11
+// Regensensor RG-11 (ASCII "It's Raining" Mode)
 bool rain_sensor_present = false;
-bool rain_detected = false;
-float rain_rate = 0.0;        // mm/h
-float rain_acc = 0.0;         // mm akkumuliert
-int rain_intensity = 0;       // 0-999
-float rain_threshold = RAIN_THRESHOLD;  // Aus Preferences loaded
+bool rain_detected = false;  // true wenn Acc > 0
+float rain_acc = 0.0;        // Regenmenge vom Sensor (Acc-Wert)
 HardwareSerial rainSerial(1); // UART1 für RG-11
-String last_rain_close = "";  // Timestamp der letzten Rain-Schließung
+String last_rain_close = "";  // Timestamp der letzten Regen-Schließung
 
-// Heater
+// Heizung
 bool heater_on = false;
 float dew_point = 0.0;
-// Heater Hysteresis
-float heater_hysteresis = 2.0;  // Aus Preferences loaded
-// Heater Modus: 0=Enabled (Auto), 1=Disabled
-int heater_mode = 0;  // Wird aus Preferences loaded
+// Heizungs-Hysterese
+float heater_hysteresis = 2.0;  // Aus Preferences geladen
+// Heizungs-Modus: 0=Aktiviert (Auto), 1=Deaktiviert
+int heater_mode = 0;  // Wird aus Preferences geladen
 
 // RTC Status
 bool rtc_present = false;  // Wird im Setup geprüft
@@ -123,7 +121,7 @@ Adafruit_BMP085 bmp180_aussen;  // BMP180
 Adafruit_BMP280 bmp280_aussen;  // BMP280
 bool bmp180_present = false;    // Flag ob BMP180 vorhanden
 bool bmp280_present = false;    // Flag ob BMP280 vorhanden
-String bmp_sensor_type = "None";  // "BMP180" oder "BMP280"
+String bmp_sensor_type = "Keine";  // "BMP180" oder "BMP280"
 float temp_innen = 0.0, hum_innen = 0.0;
 float temp_aussen = 0.0, druck_aussen = 0.0;
 
@@ -143,7 +141,7 @@ int gps_sats = 0;
 bool gps_fix = false;
 unsigned long last_gps_sync = 0;
 
-// enclosure-Status
+// Gehäuse-Status
 String status_text = "Initialisierung...";
 String status_color = "#FFA500";
 String last_error_message = "";  // Letzte Fehlermeldung für Interface
@@ -170,18 +168,18 @@ unsigned long last_ping_check = 0;
 
 // ============= HELPER FUNCTIONS =============
 
-// RTC Time mit millis() hochzählen für flüssige Anzeige
+// RTC Zeit mit millis() hochzählen für flüssige Anzeige
 void updateRTCTime() {
   unsigned long currentMillis = millis();
   
-  // RTC nur alle 60s neu auslesen (when vorhanden!)
+  // RTC nur alle 60s neu auslesen (wenn vorhanden!)
   if (rtc_present && (currentMillis - lastRTCUpdate >= RTC_UPDATE_INTERVAL)) {
     lastRTCRead = rtc.now();
     lastRTCMillis = currentMillis;
     lastRTCUpdate = currentMillis;
   }
   
-  // Berechne vergangene seconds seit letztem RTC-Read
+  // Berechne vergangene Sekunden seit letztem RTC-Read
   unsigned long elapsedSeconds = (currentMillis - lastRTCMillis) / 1000;
   DateTime currentTime = lastRTCRead + TimeSpan(elapsedSeconds);
   
@@ -189,10 +187,10 @@ void updateRTCTime() {
   is_dst = isDST(currentTime.day(), currentTime.month(), currentTime.dayOfTheWeek());
   int local_offset = timezone_offset + (is_dst ? 1 : 0);
   
-  // Localzeit berechnen
+  // Lokalzeit berechnen
   DateTime localTime = currentTime + TimeSpan(0, local_offset, 0, 0);
   
-  // Time formatieren
+  // Zeit formatieren
   char timeBufferLocal[9], timeBufferUTC[9], dateBuffer[11];
   sprintf(timeBufferLocal, "%02d:%02d:%02d", localTime.hour(), localTime.minute(), localTime.second());
   sprintf(timeBufferUTC, "%02d:%02d:%02d", currentTime.hour(), currentTime.minute(), currentTime.second());
@@ -203,7 +201,7 @@ void updateRTCTime() {
   rtc_date = String(dateBuffer);
 }
 
-// Berechne ob Sommerzeit active ist (Europa)
+// Berechne ob Sommerzeit aktiv ist (Europa)
 bool isDST(int day, int month, int dow) {
   if (month < 3 || month > 10) return false;
   if (month > 3 && month < 10) return true;
@@ -217,7 +215,7 @@ bool isDST(int day, int month, int dow) {
   return false;
 }
 
-// Synchronisiere RTC mit GPS-Time
+// Synchronisiere RTC mit GPS-Zeit
 void syncRTCwithGPS() {
   if (!rtc_present) return;  // Ohne RTC kein Sync möglich!
   if (!gps.date.isValid() || !gps.time.isValid()) return;
@@ -231,7 +229,7 @@ void syncRTCwithGPS() {
   lastRTCUpdate = millis();
   
   Serial.println("RTC mit GPS synchronisiert (UTC)");
-  Serial.printf("GPS-Time: %02d.%02d.%04d %02d:%02d:%02d UTC\n",
+  Serial.printf("GPS-Zeit: %02d.%02d.%04d %02d:%02d:%02d UTC\n",
                 gps.date.day(), gps.date.month(), gps.date.year(),
                 gps.time.hour(), gps.time.minute(), gps.time.second());
 }
@@ -265,63 +263,97 @@ void moveServoSlow(Servo &servo, int &current_pos, int target_pos) {
     for (int pos = current_pos; pos <= target_pos; pos++) {
       servo.write(pos);
       delay(servo_speed);
-      yield();  // Gib anderen Tasks Time
+      yield();  // Gib anderen Tasks Zeit
     }
   } else {
     for (int pos = current_pos; pos >= target_pos; pos--) {
       servo.write(pos);
       delay(servo_speed);
-      yield();  // Gib anderen Tasks Time
+      yield();  // Gib anderen Tasks Zeit
     }
   }
   current_pos = target_pos;
 }
 
-// RG-11 Daten lesen und parsen
+// RG-11 Daten lesen und parsen (ASCII Protokoll "It's Raining" Mode)
+// Format: "Acc X.XX\r\n"
+// Acc 1.00 = Regen, Acc 0.00 = trocken
 void readRainSensor() {
-  static String buffer = "";
+  static char buffer[32];
+  static int buf_pos = 0;
+  static unsigned long last_debug = 0;
   
   while (rainSerial.available()) {
     char c = rainSerial.read();
     
-    if (c == '\n' || c == '\r') {
-      if (buffer.length() > 0) {
-        // Parse RG-11 Ausgabe
-        // Format: "Acc 0.01, EventAcc 0.00, TotalAcc 0.01, RInt 001.234"
-        
-        if (buffer.startsWith("Acc ")) {
-          rain_acc = buffer.substring(4).toFloat();
-        }
-        else if (buffer.startsWith("RInt ")) {
-          rain_rate = buffer.substring(5).toFloat();
-          rain_intensity = (int)(rain_rate * 10);  // Visualisierung
-          
-          // Rain erkannt when über Schwellenwert
-          rain_detected = (rain_rate >= rain_threshold);
-        }
-        
-        buffer = "";
-      }
-    } else {
-      buffer += c;
-      if (buffer.length() > 100) buffer = "";  // Overflow-Schutz
+    // Zeichen in Buffer sammeln
+    if (buf_pos < 31) {
+      buffer[buf_pos++] = c;
+      buffer[buf_pos] = 0;  // Null-terminiert
     }
+    
+    // Bei \n → Frame komplett
+    if (c == '\n') {
+      // Suche nach "Acc"
+      char* acc_pos = strstr(buffer, "Acc");
+      if (acc_pos != NULL) {
+        // Parse die Zahl nach "Acc "
+        float value = 0.0;
+        if (sscanf(acc_pos, "Acc %f", &value) == 1) {
+          rain_sensor_present = true;
+          
+          // Vorheriger Wert speichern
+          float old_acc = rain_acc;
+          rain_acc = value;
+          
+          // Status aktualisieren
+          rain_detected = (rain_acc > 0.0);
+          
+          // Debug bei Änderung
+          if (rain_acc != old_acc) {
+            if (rain_detected) {
+              Serial.printf("💧 RG-11: REGEN! Acc=%.2f\n", rain_acc);
+            } else {
+              Serial.printf("☀️ RG-11: TROCKEN! Acc=%.2f\n", rain_acc);
+            }
+          }
+        }
+      }
+      
+      // Buffer zurücksetzen
+      buf_pos = 0;
+      buffer[0] = 0;
+    }
+    
+    // Buffer overflow vermeiden
+    if (buf_pos >= 31) {
+      buf_pos = 0;
+      buffer[0] = 0;
+    }
+  }
+  
+  // Debug alle 10s
+  if (millis() - last_debug > 10000) {
+    if (rain_sensor_present) {
+      Serial.printf("RG-11: Acc=%.2f, Raining=%d\n", rain_acc, rain_detected);
+    }
+    last_debug = millis();
   }
 }
 
-// Reed Contacts auslesen
+// Reed-Kontakte auslesen
 void readReedContacts() {
   reed1_state = !digitalRead(REED1_PIN);
   reed2_state = !digitalRead(REED2_PIN);
   reed3_state = !digitalRead(REED3_PIN);
 }
 
-// Dew Point berechnen (Magnus-Formel)
+// Taupunkt berechnen (Magnus-Formel)
 float calculateDewPoint(float temp_c, float humidity) {
   // Sicherheitsabfragen
   if (humidity < 1.0) humidity = 1.0;
   if (humidity > 100.0) humidity = 100.0;
-  if (temp_c < -40.0 || temp_c > 80.0) return 0.0;  // Invalide Temperature
+  if (temp_c < -40.0 || temp_c > 80.0) return 0.0;  // Ungültige Temperatur
   
   // Magnus-Formel Konstanten
   const float a = 17.27;
@@ -330,7 +362,7 @@ float calculateDewPoint(float temp_c, float humidity) {
   // Berechne alpha
   float alpha = ((a * temp_c) / (b + temp_c)) + log(humidity / 100.0);
   
-  // Berechne Dew Point
+  // Berechne Taupunkt
   float dewpoint = (b * alpha) / (a - alpha);
   
   // Sicherheitscheck Ergebnis
@@ -347,10 +379,10 @@ void checkSeestarOnline() {
     return;
   }
   
-  // Ping mit 2 seconds Timeout
+  // Ping mit 2 Sekunden Timeout
   seestar_online = Ping.ping(seestar_ip.c_str(), 2);
   
-  // Nur ausgeben when sich Status geändert hat!
+  // Nur ausgeben wenn sich Status geändert hat!
   if (seestar_online != seestar_online_last) {
     if (seestar_online) {
       Serial.printf("✓ Seestar S50 online (%s)\n", seestar_ip.c_str());
@@ -361,30 +393,30 @@ void checkSeestarOnline() {
   }
 }
 
-// Timegesteuerter Planer (Scheduler)
+// Zeitgesteuerter Planer (Scheduler)
 void checkScheduler() {
   if (!scheduler_enabled) return;
   if (!rtc_present) return;  // Ohne RTC kein Scheduler möglich!
   
-  // RTC-Time aktualisieren
+  // RTC-Zeit aktualisieren
   DateTime now = rtc.now();
   DateTime local = now + TimeSpan(0, timezone_offset + (is_dst ? 1 : 0), 0, 0);
   
   int current_hour = local.hour();
   int current_min = local.minute();
   
-  // Prüfe OPEN
+  // Prüfe ÖFFNEN
   if (current_hour == schedule_open_hour && current_min == schedule_open_min) {
     if (!schedule_open_done) {
-      Serial.printf("⏰ SCHEDULER: Opening time erreicht (%02d:%02d)\n", 
+      Serial.printf("⏰ SCHEDULER: Öffnungszeit erreicht (%02d:%02d)\n", 
                     schedule_open_hour, schedule_open_min);
       
-      // WICHTIG: Prüfe Rain!
+      // WICHTIG: Prüfe Regen!
       if (rain_detected && rain_sensor_present) {
-        Serial.println("⚠️ OPEN ABORTED: Rain erkannt!");
-        last_error_message = "⏰ Geplantes Open abgebrochen - Rain!";
+        Serial.println("⚠️ ÖFFNEN ABGEBROCHEN: Regen erkannt!");
+        last_error_message = "⏰ Geplantes Öffnen abgebrochen - Regen!";
       } else {
-        Serial.println("→ Starte Open...");
+        Serial.println("→ Starte Öffnen...");
         pending_action = OPEN;
       }
       
@@ -394,12 +426,12 @@ void checkScheduler() {
     schedule_open_done = false;  // Reset für nächsten Tag
   }
   
-  // Prüfe CLOSE
+  // Prüfe SCHLIEßEN
   if (current_hour == schedule_close_hour && current_min == schedule_close_min) {
     if (!schedule_close_done) {
-      Serial.printf("⏰ SCHEDULER: Closing time erreicht (%02d:%02d)\n", 
+      Serial.printf("⏰ SCHEDULER: Schließzeit erreicht (%02d:%02d)\n", 
                     schedule_close_hour, schedule_close_min);
-      Serial.println("→ Starte Close...");
+      Serial.println("→ Starte Schließen...");
       pending_action = CLOSE;
       schedule_close_done = true;
     }
@@ -408,216 +440,216 @@ void checkScheduler() {
   }
 }
 
-// Heater Steuerung (mit Hysteresis)
+// Heizungs-Steuerung (mit Hysterese)
 void controlHeater() {
-  // Dew Point IMMER berechnen (auch bei openem enclosure für Anzeige!)
+  // Taupunkt IMMER berechnen (auch bei offenem Gehäuse für Anzeige!)
   dew_point = calculateDewPoint(temp_innen, hum_innen);
   
-  // Wenn Heater deactiveiert (heater_mode = 1) → nichts tun
+  // Wenn Heizung deaktiviert (heater_mode = 1) → nichts tun
   if (heater_mode == 1) {
-    // Heater ist deactiveiert
+    // Heizung ist deaktiviert
     if (heater_on) {
       digitalWrite(HEATER_PIN, LOW);
       heater_on = false;
-      Serial.println("Heater OFF (Disabled)");
+      Serial.println("Heizung AUS (Deaktiviert)");
     }
     return;
   }
   
   // Ab hier: Auto-Modus (heater_mode == 0)
   
-  // Nur when enclosure closed (Reed1 + Reed2, aber Reed2 optional)
+  // Nur wenn Gehäuse geschlossen (Reed1 + Reed2, aber Reed2 optional)
   readReedContacts();
   
-  // Prüfe Reed1 immer, Reed2 only if activeiert
+  // Prüfe Reed1 immer, Reed2 nur wenn aktiviert
   if (!reed1_state || (reed2_enabled && !reed2_state)) {
-    // enclosure open oder not locked → Heater OFF
+    // Gehäuse offen oder nicht verriegelt → Heizung AUS
     if (heater_on) {
       digitalWrite(HEATER_PIN, LOW);
       heater_on = false;
-      Serial.println("Heater OFF (Observatory open)");
+      Serial.println("Heizung AUS (Sternwarte offen)");
     }
     return;
   }
   
-  // Heater Logik mit Hysteresis (INNEN-Temperature!)
+  // Heizungs-Logik mit Hysterese (INNEN-Temperatur!)
   if (!heater_on) {
-    // Heater ist OFF → ON when Inside temp <= Dew Point
+    // Heizung ist AUS → AN wenn Innentemp <= Taupunkt
     if (temp_innen <= dew_point) {
       digitalWrite(HEATER_PIN, HIGH);
       heater_on = true;
-      Serial.printf("Heater ON (Innen: %.1f°C <= Dew Point: %.1f°C)\n", temp_innen, dew_point);
+      Serial.printf("Heizung AN (Innen: %.1f°C <= Taupunkt: %.1f°C)\n", temp_innen, dew_point);
     }
   } else {
-    // Heater ist ON → OFF when Inside temp > Dew Point + Hysteresis
+    // Heizung ist AN → AUS wenn Innentemp > Taupunkt + Hysterese
     if (temp_innen > dew_point + heater_hysteresis) {
       digitalWrite(HEATER_PIN, LOW);
       heater_on = false;
-      Serial.printf("Heater OFF (Innen: %.1f°C > Dew Point+Hyst: %.1f°C)\n", temp_innen, dew_point + heater_hysteresis);
+      Serial.printf("Heizung AUS (Innen: %.1f°C > Taupunkt+Hyst: %.1f°C)\n", temp_innen, dew_point + heater_hysteresis);
     }
   }
 }
 
-// Berechne enclosure-Status für Text-Anzeige
+// Berechne Gehäuse-Status für Text-Anzeige
 void updateStatusText() {
   readReedContacts();
   
-  // Effektiver Reed2-Status (immer true when deactiveiert)
+  // Effektiver Reed2-Status (immer true wenn deaktiviert)
   bool reed2_effective = reed2_enabled ? reed2_state : true;
   
-  // CLOSED GRÜN: Alles zu und verriegelt
+  // GESCHLOSSEN GRÜN: Alles zu und verriegelt
   if (reed1_state && reed2_effective && reed3_state) {
-    status_text = "CLOSED ✓";
+    status_text = "GESCHLOSSEN ✓";
     status_color = "#00FF00";
     return;
   }
   
-  // OPEN GRÜN: Cover auf Position 2 UND Reed1+2 inactive
+  // GEÖFFNET GRÜN: Klappe auf Position 2 UND Reed1+2 inaktiv
   if (servo2_pos == servo2_pos2 && !reed1_state && (reed2_enabled ? !reed2_state : true)) {
-    status_text = "OPEN ✓";
+    status_text = "GEÖFFNET ✓";
     status_color = "#00FF00";
     return;
   }
   
-  // HALF-OPEN: Position 3
+  // HALBOFFEN: Position 3
   if (servo2_pos == servo2_pos3) {
-    status_text = "HALF-OPEN";
+    status_text = "HALBOFFEN";
     status_color = "#FFA500";
     return;
   }
   
-  // ERROR ROT: Cover soll zu sein, aber Reeds nicht active (nur Reed1 prüfen when Reed2 deactiveiert)
+  // FEHLER ROT: Klappe soll zu sein, aber Reeds nicht aktiv (nur Reed1 prüfen wenn Reed2 deaktiviert)
   if (servo2_pos == servo2_pos1 && (!reed1_state || (reed2_enabled && !reed2_state))) {
-    status_text = "ERROR!";
+    status_text = "FEHLER!";
     status_color = "#FF0000";
     return;
   }
   
-  // MOVING
-  status_text = "MOVING";
+  // IN BEWEGUNG
+  status_text = "IN BEWEGUNG";
   status_color = "#FFA500";
 }
 
 String getStatusDetail() {
   String detail = "";
   
-  // Spezifische Fehlermeldungen bei closeder Cover
-  if (servo2_pos == servo2_pos1) {  // Cover soll closed sein
-    // Reed2-Check only if activeiert
+  // Spezifische Fehlermeldungen bei geschlossener Klappe
+  if (servo2_pos == servo2_pos1) {  // Klappe soll geschlossen sein
+    // Reed2-Check nur wenn aktiviert
     bool reed2_check = reed2_enabled ? !reed2_state : false;
     
     if (!reed1_state && reed2_check) {
-      return "⚠️ Cover UND Lock stuck!";
+      return "⚠️ Klappe UND Verriegelung klemmen!";
     } else if (!reed1_state) {
-      return "⚠️ Cover stuck - nicht closed!";
+      return "⚠️ Klappe klemmt - nicht geschlossen!";
     } else if (reed2_check) {
-      return "⚠️ Lock stuck - not locked!";
+      return "⚠️ Verriegelung klemmt - nicht verriegelt!";
     }
   }
   
   // Normale Status-Anzeige
-  if (reed1_state) detail += "Cover OK ";
-  else detail += "Cover open ";
+  if (reed1_state) detail += "Klappe OK ";
+  else detail += "Klappe offen ";
   
-  // Reed2 nur anzeigen when activeiert
+  // Reed2 nur anzeigen wenn aktiviert
   if (reed2_enabled) {
     if (reed2_state) detail += "| Riegel OK ";
-    else detail += "| Riegel open ";
+    else detail += "| Riegel offen ";
   }
   
-  if (reed3_state) detail += "| Tube OK";
-  else detail += "| Tube active";
+  if (reed3_state) detail += "| Tubus OK";
+  else detail += "| Tubus aktiv";
   
   return detail;
 }
 
 // ============= ABLAUF-FUNKTIONEN =============
 
-// Kuppel OPEN mit Reed-Check
+// Kuppel ÖFFNEN mit Reed-Check
 bool openDome() {
-  Serial.println("=== OPEN-Ablauf START ===");
+  Serial.println("=== ÖFFNEN-Ablauf START ===");
   
-  // 1. Lock entriegeln
-  Serial.println("1. Entriegele Lock...");
+  // 1. Verriegelung entriegeln
+  Serial.println("1. Entriegele Verriegelung...");
   moveServoSlow(servo3, servo3_pos, servo3_pos2);
   preferences.putInt("servo3", servo3_pos);
   
-  // 2. Waiting for Reed2 = FALSE / max 5 seconds (only if Reed2 activeiert)
+  // 2. Warte auf Reed2 = FALSE / max 5 Sekunden (nur wenn Reed2 aktiviert)
   if (reed2_enabled) {
-    Serial.println("2. Waiting for Lock open...");
+    Serial.println("2. Warte auf Verriegelung offen...");
     unsigned long timeout = millis();
     while (millis() - timeout < 5000) {
       readReedContacts();
-      if (reed2_state == false) {  // Lock open (Reed inactive)
-        Serial.println("   ✓ Lock open!");
+      if (reed2_state == false) {  // Verriegelung offen (Reed inaktiv)
+        Serial.println("   ✓ Verriegelung offen!");
         break;
       }
       delay(100);
       yield();
     }
     
-    // 3. Check: Hat sich Lock geöffnet?
+    // 3. Prüfung: Hat sich Verriegelung geöffnet?
     readReedContacts();
     if (reed2_state) {
-      Serial.println("   ✗ ERROR: Lock stuck!");
-      Serial.println("   Position holding position - check manually!");
-      last_error_message = "⚠️ OPEN FAILED: Lock stuck!";
+      Serial.println("   ✗ FEHLER: Verriegelung klemmt!");
+      Serial.println("   Position wird gehalten - manuell prüfen!");
+      last_error_message = "⚠️ ÖFFNEN FEHLGESCHLAGEN: Verriegelung klemmt!";
       return false;
     }
   } else {
-    Serial.println("2. Lock-Check übersprungen (Reed2 deactiveiert)");
+    Serial.println("2. Verriegelung-Check übersprungen (Reed2 deaktiviert)");
   }
   
   // Fehler zurücksetzen bei Erfolg
   last_error_message = "";
   
-  // 4. Cover öffnen
-  Serial.println("3. Öffne Cover...");
+  // 4. Klappe öffnen
+  Serial.println("3. Öffne Klappe...");
   delay(1000);
   moveServoSlow(servo2, servo2_pos, servo2_pos2);
   preferences.putInt("servo2", servo2_pos);
   
-  Serial.println("=== OPEN-Ablauf FERTIG ===");
+  Serial.println("=== ÖFFNEN-Ablauf FERTIG ===");
   return true;
 }
 
-// Kuppel CLOSE mit Prüfung
+// Kuppel SCHLIEßEN mit Prüfung
 bool closeDome() {
-  Serial.println("=== CLOSE-Ablauf START ===");
+  Serial.println("=== SCHLIEßEN-Ablauf START ===");
   
   readReedContacts();
   
-  // Check: Lock open? Tube eingefahren?
-  // Reed2-Check only if activeiert
-  bool verriegelung_ok = reed2_enabled ? (reed2_state == false) : true;  // Muss open sein (oder deactiveiert)
+  // Prüfung: Verriegelung offen? Tubus eingefahren?
+  // Reed2-Check nur wenn aktiviert
+  bool verriegelung_ok = reed2_enabled ? (reed2_state == false) : true;  // Muss offen sein (oder deaktiviert)
   bool tubus_ok = (reed3_state == true);          // Muss eingefahren sein
   
-  Serial.printf("Check: Lock %s | Tube %s\n", 
-                verriegelung_ok ? "OK" : "ERROR",
-                tubus_ok ? "OK" : "ERROR");
+  Serial.printf("Prüfung: Verriegelung %s | Tubus %s\n", 
+                verriegelung_ok ? "OK" : "FEHLER",
+                tubus_ok ? "OK" : "FEHLER");
   
-  // Falls Tube NICHT eingefahren: Nur HALF-OPEN
+  // Falls Tubus NICHT eingefahren: Nur HALBOFFEN
   if (!tubus_ok) {
-    Serial.println("⚠ Tube not retracted → Cover nur HALF-OPEN");
+    Serial.println("⚠ Tubus nicht eingefahren → Klappe nur HALBOFFEN");
     moveServoSlow(servo2, servo2_pos, servo2_pos3);
     preferences.putInt("servo2", servo2_pos);
-    last_error_message = "⚠️ CLOSE ABORTED: Tube not retracted - Cover half-open!";
-    Serial.println("=== CLOSE-Ablauf ABORTED (Halboffen) ===");
+    last_error_message = "⚠️ SCHLIEßEN ABGEBROCHEN: Tubus nicht eingefahren - Klappe halboffen!";
+    Serial.println("=== SCHLIEßEN-Ablauf ABGEBROCHEN (Halboffen) ===");
     return false;
   }
   
-  // 1. Cover schließen
-  Serial.println("1. Schließe Cover...");
+  // 1. Klappe schließen
+  Serial.println("1. Schließe Klappe...");
   moveServoSlow(servo2, servo2_pos, servo2_pos1);
   preferences.putInt("servo2", servo2_pos);
   
-  // 1a. Prüfe ob Cover closed (max 3 seconds warten)
-  Serial.println("1a. Prüfe Cover closed...");
+  // 1a. Prüfe ob Klappe geschlossen (max 3 Sekunden warten)
+  Serial.println("1a. Prüfe Klappe geschlossen...");
   unsigned long timeout = millis();
   while (millis() - timeout < 3000) {
     readReedContacts();
-    if (reed1_state) {  // Cover closed
-      Serial.println("   ✓ Cover closed!");
+    if (reed1_state) {  // Klappe geschlossen
+      Serial.println("   ✓ Klappe geschlossen!");
       break;
     }
     delay(100);
@@ -626,32 +658,32 @@ bool closeDome() {
   
   readReedContacts();
   if (!reed1_state) {
-    Serial.println("   ✗ ERROR: Cover stuck!");
-    Serial.println("   Position holding position - check manually!");
-    last_error_message = "⚠️ CLOSE FAILED: Cover stuck - nicht closed!";
+    Serial.println("   ✗ FEHLER: Klappe klemmt!");
+    Serial.println("   Position wird gehalten - manuell prüfen!");
+    last_error_message = "⚠️ SCHLIEßEN FEHLGESCHLAGEN: Klappe klemmt - nicht geschlossen!";
     return false;
   }
   
-  // 2. Warte 3 seconds
-  Serial.println("2. Warte 3 seconds...");
+  // 2. Warte 3 Sekunden
+  Serial.println("2. Warte 3 Sekunden...");
   for (int i = 0; i < 30; i++) {
     delay(100);
     yield();
   }
   
-  // 3. Lock schließen
+  // 3. Verriegelung schließen
   Serial.println("3. Verriegele...");
   moveServoSlow(servo3, servo3_pos, servo3_pos1);
   preferences.putInt("servo3", servo3_pos);
   
-  // 3a. Prüfe ob Lock closed (max 3 seconds warten) - only if Reed2 activeiert
+  // 3a. Prüfe ob Verriegelung geschlossen (max 3 Sekunden warten) - nur wenn Reed2 aktiviert
   if (reed2_enabled) {
-    Serial.println("3a. Prüfe Lock closed...");
+    Serial.println("3a. Prüfe Verriegelung geschlossen...");
     timeout = millis();
     while (millis() - timeout < 3000) {
       readReedContacts();
-      if (reed2_state) {  // Lock closed
-        Serial.println("   ✓ Lock closed!");
+      if (reed2_state) {  // Verriegelung geschlossen
+        Serial.println("   ✓ Verriegelung geschlossen!");
         break;
       }
       delay(100);
@@ -660,19 +692,19 @@ bool closeDome() {
     
     readReedContacts();
     if (!reed2_state) {
-      Serial.println("   ✗ ERROR: Lock stuck!");
-      Serial.println("   Position holding position - check manually!");
-      last_error_message = "⚠️ CLOSE FAILED: Lock stuck - not locked!";
+      Serial.println("   ✗ FEHLER: Verriegelung klemmt!");
+      Serial.println("   Position wird gehalten - manuell prüfen!");
+      last_error_message = "⚠️ SCHLIEßEN FEHLGESCHLAGEN: Verriegelung klemmt - nicht verriegelt!";
       return false;
     }
   } else {
-    Serial.println("3a. Locks-Check übersprungen (Reed2 deactiveiert)");
+    Serial.println("3a. Verriegelungs-Check übersprungen (Reed2 deaktiviert)");
   }
   
   // Fehler zurücksetzen bei Erfolg
   last_error_message = "";
   
-  Serial.println("=== CLOSE-Ablauf FERTIG ===");
+  Serial.println("=== SCHLIEßEN-Ablauf FERTIG ===");
   return true;
 }
 
@@ -682,7 +714,7 @@ void toggleS50() {
   moveServoSlow(servo1, servo1_pos, servo1_pos2);
   preferences.putInt("servo1", servo1_pos);
   
-  // 2,5 seconds warten (mit yield für Watchdog)
+  // 2,5 Sekunden warten (mit yield für Watchdog)
   for (int i = 0; i < 25; i++) {
     delay(100);
     yield();
@@ -693,7 +725,7 @@ void toggleS50() {
   Serial.println("S50 Taster gedrückt (2,5s)");
 }
 
-// REGEN-Emergency close (intelligent)
+// REGEN-Notschließung (intelligent)
 void emergencyRainClose() {
   Serial.println("=== REGEN-NOTSCHLIESSUNG ===");
   
@@ -703,23 +735,28 @@ void emergencyRainClose() {
   
   readReedContacts();
   
-  // FALL 1: Tube bereits in standby → Sofort komplett schließen
+  // FALL 1: Tubus bereits im Standby → Sofort komplett schließen
   if (reed3_state) {
-    Serial.println("✓ Tube bereits in standby!");
+    Serial.println("✓ Tubus bereits im Standby!");
     Serial.println("→ Schließe sofort komplett...");
     
     closeDome();
+    
+    // Regen-Akkumulation zurücksetzen
+    rain_acc = 0.0;
+    
+    Serial.println("✓ Regen-Akkumulation zurückgesetzt");
     
     Serial.println("=== REGEN-NOTSCHLIESSUNG FERTIG (Sofort) ===");
     last_error_message = "";  // Kein Fehler
     return;
   }
   
-  // FALL 2: Tube NICHT in standby → Prüfe ob Seestar active
-  Serial.println("⚠ Tube nicht in standby!");
+  // FALL 2: Tubus NICHT im Standby → Prüfe ob Seestar aktiv
+  Serial.println("⚠ Tubus nicht im Standby!");
   
-  // 1. Cover half-open (Schutz!)
-  Serial.println("1. Fahre Cover auf HALF-OPEN...");
+  // 1. Klappe halboffen (Schutz!)
+  Serial.println("1. Fahre Klappe auf HALBOFFEN...");
   moveServoSlow(servo2, servo2_pos, servo2_pos3);
   preferences.putInt("servo2", servo2_pos);
   
@@ -728,39 +765,44 @@ void emergencyRainClose() {
   bool seestar_online = Ping.ping(seestar_ip.c_str(), 1);
   
   if (seestar_online) {
-    // Seestar ist ON → Herunterfahren
+    // Seestar ist AN → Herunterfahren
     Serial.println("   ✓ Seestar ONLINE → Fahre herunter (2,5s Taster)");
     toggleS50();
   } else {
-    // Seestar ist schon OFF → NICHT einschalten!
+    // Seestar ist schon AUS → NICHT einschalten!
     Serial.println("   ✓ Seestar OFFLINE → Bereits ausgeschaltet, kein Taster!");
   }
   
-  // 3. Waiting for Tube eingefahren (max 60 seconds)
-  Serial.println("3. Waiting for Tube in standby...");
+  // 3. Warte auf Tubus eingefahren (max 60 Sekunden)
+  Serial.println("3. Warte auf Tubus im Standby...");
   unsigned long timeout = millis();
   while (millis() - timeout < 60000) {
     readReedContacts();
-    if (reed3_state) {  // Tube eingefahren
-      Serial.println("   ✓ Tube in standby!");
+    if (reed3_state) {  // Tubus eingefahren
+      Serial.println("   ✓ Tubus im Standby!");
       break;
     }
     delay(500);
     yield();
   }
   
-  // 4. Prüfe ob Tube wirklich eingefahren
+  // 4. Prüfe ob Tubus wirklich eingefahren
   readReedContacts();
   if (!reed3_state) {
-    Serial.println("   ⚠ WARNUNG: Tube nach 60s still not in standby!");
-    Serial.println("   → Fahre trotzdem half-open (Schutz vor Rain)");
-    last_error_message = "☔ Rain emergency close: Tube-Timeout! Cover half-open!";
-    return;  // Bleibt half-open!
+    Serial.println("   ⚠ WARNUNG: Tubus nach 60s immer noch nicht im Standby!");
+    Serial.println("   → Fahre trotzdem halboffen (Schutz vor Regen)");
+    last_error_message = "☔ Regen-Notschließung: Tubus-Timeout! Klappe halboffen!";
+    return;  // Bleibt halboffen!
   }
   
   // 5. Komplett schließen
   Serial.println("4. Schließe komplett...");
   closeDome();
+  
+  // Regen-Akkumulation zurücksetzen
+  rain_acc = 0.0;
+  
+  Serial.println("✓ Regen-Akkumulation zurückgesetzt");
   
   Serial.println("=== REGEN-NOTSCHLIESSUNG FERTIG (Mit Runterfahren) ===");
   last_error_message = "";  // Kein Fehler
@@ -773,7 +815,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>S50 Observatory</title>
+  <title>S50 Sternwarte</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body {
@@ -930,11 +972,11 @@ const char index_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="container">
-    <h1>🔭 S50 Observatory Control</h1>
+    <h1>🔭 S50 Sternwarte-Steuerung</h1>
     
     <div style="display: flex; gap: 10px; margin-bottom: 20px;">
-      <button class="settings-btn" onclick="location.href='/scheduler'" style="flex: 1;">⏰ Scheduler</button>
-      <button class="settings-btn" onclick="location.href='/settings'" style="flex: 1;">⚙️ Settings</button>
+      <button class="settings-btn" onclick="location.href='/scheduler'" style="flex: 1;">⏰ Zeitplaner</button>
+      <button class="settings-btn" onclick="location.href='/settings'" style="flex: 1;">⚙️ Einstellungen</button>
     </div>
     
     <!-- WiFi Info -->
@@ -945,20 +987,20 @@ const char index_html[] PROGMEM = R"rawliteral(
       <div class="wifi-signal">▂▄▆█ <span id="wifi_rssi">--</span> dBm</div>
     </div>
     
-    <!-- Rain-Warning (only if Sensor vorhanden) -->
+    <!-- Regen-Warnung (nur wenn Sensor vorhanden) -->
     <div id="rain_warning" style="display:none;" class="rain-warning">
-      ⚠️ REGEN ERKANNT! Emergency close active!
+      ⚠️ REGEN ERKANNT! Notschließung aktiv!
     </div>
     
-    <!-- Fehler-Meldung (only if Fehler aufgetreten) -->
+    <!-- Fehler-Meldung (nur wenn Fehler aufgetreten) -->
     <div id="error_message" style="display:none;" class="rain-warning">
       <span id="error_text"></span>
       <button onclick="document.getElementById('error_message').style.display='none'" style="margin-left:15px; padding:5px 10px;">✕</button>
     </div>
     
-    <!-- Rain-Schließung Info (only if erfolgt) -->
+    <!-- Regen-Schließung Info (nur wenn erfolgt) -->
     <div id="rain_close_info" style="display:none;" class="rain-info">
-      ☔ Letzte Rain-Schließung: <span id="rain_close_time">--</span>
+      ☔ Letzte Regen-Schließung: <span id="rain_close_time">--</span>
     </div>
     
     <!-- Status-Anzeige -->
@@ -969,15 +1011,15 @@ const char index_html[] PROGMEM = R"rawliteral(
       <div class="reed-status">
         <div class="reed-item">
           <div id="led1" class="led led-off"></div>
-          <div>Cover<br>geschlossen</div>
+          <div>Klappe<br>geschlossen</div>
         </div>
         <div class="reed-item">
           <div id="led2" class="led led-off"></div>
-          <div>Lock<br>geschlossen</div>
+          <div>Verriegelung<br>geschlossen</div>
         </div>
         <div class="reed-item">
           <div id="led3" class="led led-off"></div>
-          <div>Tube<br>Standby</div>
+          <div>Tubus<br>Standby</div>
         </div>
       </div>
     </div>
@@ -988,22 +1030,22 @@ const char index_html[] PROGMEM = R"rawliteral(
         <h3>🌡️ Innen</h3>
         <div class="sensor-value"><span id="temp_i">--</span>°C</div>
         <div class="sensor-value" style="font-size: 18px; margin-top: 10px;"><span id="hum_i">--</span>%</div>
-        <div class="sensor-label">Humidity</div>
+        <div class="sensor-label">Luftfeuchtigkeit</div>
       </div>
       
       <div class="sensor-box">
         <h3>☁️ Außen</h3>
         <div class="sensor-value"><span id="temp_a">--</span>°C</div>
         <div class="sensor-value" style="font-size: 18px; margin-top: 10px;"><span id="druck_a">--</span> hPa</div>
-        <div class="sensor-label">Air Pressure</div>
+        <div class="sensor-label">Luftdruck</div>
       </div>
       
       <div class="sensor-box" id="time_box">
-        <h3>🕐 Time</h3>
+        <h3>🕐 Zeit</h3>
         <div class="sensor-value" style="font-size: 20px;"><span id="time_l">--:--</span></div>
         <div class="sensor-label"><span id="date_l">--.--.--</span> <span id="dst_l">MEZ</span></div>
         <div id="scheduler_info" style="margin-top: 8px; padding: 5px; background: #0a0a0a; border-radius: 5px; border: 1px solid #333; font-size: 12px;">
-          <span style="color: #00AAFF;">⏰</span> <span id="scheduler_times" style="color: #888;">Loading...</span>
+          <span style="color: #00AAFF;">⏰</span> <span id="scheduler_times" style="color: #888;">Lädt...</span>
         </div>
       </div>
       
@@ -1013,39 +1055,25 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div class="sensor-label">Sats: <span id="sats_g">0</span></div>
       </div>
       
-      <!-- Rain Sensor (nur if present) -->
+      <!-- Regensensor (nur wenn vorhanden) -->
       <div class="sensor-box" id="rain_box" style="display:none;">
-        <h3>🌧️ Rain</h3>
-        <div class="sensor-value" id="rain_status">DRY</div>
+        <h3>🌧️ Regen</h3>
+        <div class="sensor-value" id="rain_status">TROCKEN</div>
         
-        <!-- Rain-Intensität Balken -->
-        <div style="margin: 15px 0;">
-          <div style="font-size: 12px; color: #AAA; margin-bottom: 5px;">
-            Intensität: <span id="rain_rate_value" style="color: #00AAFF; font-weight: bold;">0.0</span> mm/h
-          </div>
-          <div style="position: relative; height: 30px; background: #222; border-radius: 5px; overflow: hidden; border: 1px solid #444;">
-            <!-- Schwellwert-Markierung -->
-            <div style="position: absolute; left: 10%; width: 2px; height: 100%; background: #FF6600; z-index: 2;"></div>
-            <div style="position: absolute; left: 10%; top: -20px; color: #FF6600; font-size: 10px; white-space: nowrap;">⚠️ 0.5</div>
-            
-            <!-- Rain-Balken -->
-            <div id="rain_bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, #00AAFF, #0066FF); transition: width 0.5s;"></div>
-          </div>
-        </div>
-        
-        <!-- Akkumulierter Rain -->
-        <div style="font-size: 11px; color: #888; margin-top: 5px;">
-          Akkumuliert: <span id="rain_acc_value" style="color: #AAA;">0.00</span> mm
+        <!-- Regenmenge -->
+        <div style="margin-top: 10px; font-size: 14px; color: #888;">
+          Menge: <span id="rain_acc_value" style="color: #00AAFF; font-weight: bold;">0.00</span> mm
+          <button onclick="resetRain()" style="padding: 2px 8px; font-size: 10px; margin-left: 10px; background: #444; border: 1px solid #666; color: #FFF; border-radius: 3px; cursor: pointer;">🔄 Reset</button>
         </div>
         
         <div class="sensor-label">RG-11 UART Sensor</div>
       </div>
       
-      <!-- Heater -->
+      <!-- Heizung -->
       <div class="sensor-box">
-        <h3 id="heater_icon">🔥 Heater</h3>
-        <div class="sensor-value" style="font-size: 20px;" id="heater_status">OFF</div>
-        <div class="sensor-label">Dew Point: <span id="dew_point">--</span>°C</div>
+        <h3 id="heater_icon">🔥 Heizung</h3>
+        <div class="sensor-value" style="font-size: 20px;" id="heater_status">AUS</div>
+        <div class="sensor-label">Taupunkt: <span id="dew_point">--</span>°C</div>
       </div>
       
       <!-- Seestar S50 Status -->
@@ -1058,8 +1086,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     
     <!-- Haupt-Buttons -->
     <div class="button-grid">
-      <button onclick="openDome()">▲ Kuppel OPEN</button>
-      <button onclick="closeDome()">▼ Kuppel CLOSE</button>
+      <button onclick="openDome()">▲ Kuppel ÖFFNEN</button>
+      <button onclick="closeDome()">▼ Kuppel SCHLIEßEN</button>
       <button onclick="toggleS50()">⚡ S50 EIN/AUS</button>
     </div>
     
@@ -1074,10 +1102,10 @@ const char index_html[] PROGMEM = R"rawliteral(
       fetch('/status')
         .then(r => r.json())
         .then(d => {
-          // Reed Contacts
+          // Reed-Kontakte
           document.getElementById('led1').className = d.reed1 ? 'led led-on' : 'led led-off';
           
-          // Reed2 only if activeiert, sonst ausgrauen
+          // Reed2 nur wenn aktiviert, sonst ausgrauen
           if (d.reed2_enabled) {
             document.getElementById('led2').className = d.reed2 ? 'led led-on' : 'led led-off';
             document.getElementById('led2').style.opacity = '1.0';
@@ -1097,7 +1125,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           document.getElementById('date_l').textContent = d.rtc_date;
           document.getElementById('dst_l').textContent = d.is_dst ? 'MESZ' : 'MEZ';
           
-          // Scheduler Timeen
+          // Zeitplaner Zeiten
           const schedulerTimes = document.getElementById('scheduler_times');
           if (d.scheduler_enabled) {
             const openTime = String(d.schedule_open_hour).padStart(2, '0') + ':' + String(d.schedule_open_min).padStart(2, '0');
@@ -1107,7 +1135,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             schedulerTimes.innerHTML = '<span style="color: #888;">Aus</span>';
           }
           
-          // Time-Box färben je nach RTC-Status
+          // Zeit-Box färben je nach RTC-Status
           const timeBox = document.getElementById('time_box');
           if (d.rtc_present) {
             timeBox.style.borderColor = '#00FF00';  // Grün
@@ -1145,7 +1173,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             wifiSignal.style.color = '#FF6600';  // Schwach
           }
           
-          // Rain Sensor (nur if present)
+          // Regensensor (nur wenn vorhanden)
           if (d.rain_sensor_present) {
             document.getElementById('rain_box').style.display = 'block';
             const rainStatus = document.getElementById('rain_status');
@@ -1157,40 +1185,17 @@ const char index_html[] PROGMEM = R"rawliteral(
               rainStatus.style.color = '#FF0000';
               rainWarning.style.display = 'block';
             } else {
-              rainStatus.textContent = 'DRY';
+              rainStatus.textContent = 'TROCKEN';
               rainStatus.style.color = '#00FF00';
               rainWarning.style.display = 'none';
             }
             
-            // Intensitäts-Values
+            // Intensitäts-Werte
             document.getElementById('rain_rate_value').textContent = d.rain_rate.toFixed(1);
             document.getElementById('rain_acc_value').textContent = d.rain_acc.toFixed(2);
-            
-            // Balken-Grafik (max 5 mm/h = 100%)
-            const rainBar = document.getElementById('rain_bar');
-            
-            if (d.rain_rate <= 0) {
-              // Kein Rain = leerer Balken
-              rainBar.style.width = '0%';
-              rainBar.style.background = '#444';  // Grau/unsichtbar
-            } else {
-              const percentage = Math.min((d.rain_rate / 5.0) * 100, 100);
-              rainBar.style.width = percentage + '%';
-              
-              // Farbe basierend auf Intensität
-              if (d.rain_rate >= 2.0) {
-                rainBar.style.background = 'linear-gradient(90deg, #FF0000, #FF6600)';  // Stark
-              } else if (d.rain_rate >= 0.5) {
-                rainBar.style.background = 'linear-gradient(90deg, #FF6600, #FFAA00)';  // Mittel
-              } else if (d.rain_rate > 0.1) {
-                rainBar.style.background = 'linear-gradient(90deg, #FFAA00, #00AAFF)';  // Leicht
-              } else {
-                rainBar.style.background = 'linear-gradient(90deg, #00AAFF, #0066FF)';  // Sehr leicht
-              }
-            }
           }
           
-          // Heater
+          // Heizung
           const heaterStatus = document.getElementById('heater_status');
           const heaterIcon = document.getElementById('heater_icon');
           const dewPoint = document.getElementById('dew_point');
@@ -1227,11 +1232,11 @@ const char index_html[] PROGMEM = R"rawliteral(
           const statusImg = document.getElementById('status_image');
           let imageName = '';
           
-          if (d.status_text.includes('CLOSED')) {
+          if (d.status_text.includes('GESCHLOSSEN')) {
             imageName = d.last_error ? 'S50_Geschlossen_rot.png' : 'S50_Geschlossen_gruen.png';
-          } else if (d.status_text.includes('OPEN')) {
+          } else if (d.status_text.includes('GEÖFFNET')) {
             imageName = 'S50_offen_gruen.png';
-          } else if (d.status_text.includes('HALF-OPEN')) {
+          } else if (d.status_text.includes('HALBOFFEN')) {
             imageName = 'S50_halboffen_orange.png';
           } else {
             imageName = 'S50_Geschlossen_rot.png';  // Fehler
@@ -1249,7 +1254,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             errorBox.style.display = 'none';
           }
           
-          // Rain-Schließung Info (falls vorhanden)
+          // Regen-Schließung Info (falls vorhanden)
           const rainCloseBox = document.getElementById('rain_close_info');
           const rainCloseTime = document.getElementById('rain_close_time');
           if (d.last_rain_close && d.last_rain_close !== '') {
@@ -1269,7 +1274,7 @@ const char index_html[] PROGMEM = R"rawliteral(
               console.log('Öffne...');
             }
           })
-          .catch(e => console.error('Error:', e));
+          .catch(e => console.error('Fehler:', e));
       }
     }
     
@@ -1281,12 +1286,24 @@ const char index_html[] PROGMEM = R"rawliteral(
               console.log('Schließe...');
             }
           })
-          .catch(e => console.error('Error:', e));
+          .catch(e => console.error('Fehler:', e));
       }
     }
     
     function toggleS50() {
       fetch('/action?cmd=toggle').then(r => r.text()).then(t => console.log(t));
+    }
+    
+    function resetRain() {
+      if(confirm('Regen-Akkumulation zurücksetzen?')) {
+        fetch('/rain/reset')
+          .then(response => {
+            if (response.ok) {
+              console.log('Akkumulation zurückgesetzt');
+            }
+          })
+          .catch(e => console.error('Fehler:', e));
+      }
     }
   </script>
 </body>
@@ -1300,7 +1317,7 @@ const char settings_html[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>S50 Settings</title>
+  <title>S50 Einstellungen</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body { background-color: #000; color: #FFF; font-family: Arial, sans-serif; text-align: center; margin: 20px; }
@@ -1366,32 +1383,32 @@ const char settings_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="container">
-    <h1>⚙️ S50 Settings</h1>
+    <h1>⚙️ S50 Einstellungen</h1>
     
-    <button class="home-btn" onclick="location.href='/'">🏠 Back</button>
+    <button class="home-btn" onclick="location.href='/'">🏠 Zurück</button>
     
-    <!-- Fehler-Meldung (only if Fehler aufgetreten) -->
+    <!-- Fehler-Meldung (nur wenn Fehler aufgetreten) -->
     <div id="error_message" style="display:none; background:#8B0000; border:2px solid #FF0000; padding:15px; margin:20px 0; border-radius:5px; animation:pulse 2s infinite;">
       <span id="error_text"></span>
       <button onclick="document.getElementById('error_message').style.display='none'" style="margin-left:15px; padding:5px 10px;">✕</button>
     </div>
     
-    <!-- Rain-Schließung Info (only if erfolgt) -->
+    <!-- Regen-Schließung Info (nur wenn erfolgt) -->
     <div id="rain_close_info" style="display:none;" class="rain-info">
-      ☔ Letzte Rain-Schließung: <span id="rain_close_time">--</span>
+      ☔ Letzte Regen-Schließung: <span id="rain_close_time">--</span>
     </div>
     
     <div class="columns">
-      <!-- Linke Spalte: Weather Data -->
+      <!-- Linke Spalte: Wetterdaten -->
       <div class="column-left">
         
         <div class="section">
          <h2>🌡️ Wetter Innen</h2>
          <div style="text-align: center;">
            <div class="weather-value"><span id="temp_innen">--</span> °C</div>
-           <div class="weather-label">Temperature</div>
+           <div class="weather-label">Temperatur</div>
            <div class="weather-value" style="margin-top: 20px;"><span id="hum_innen">--</span> %</div>
-           <div class="weather-label">Humidity</div>
+           <div class="weather-label">Luftfeuchtigkeit</div>
          </div>
         </div>
         
@@ -1399,22 +1416,22 @@ const char settings_html[] PROGMEM = R"rawliteral(
          <h2>☁️ Wetter Außen</h2>
          <div style="text-align: center;">
            <div class="weather-value"><span id="temp_aussen">--</span> °C</div>
-           <div class="weather-label">Temperature</div>
+           <div class="weather-label">Temperatur</div>
            <div class="weather-value" style="margin-top: 20px;"><span id="druck_aussen">--</span> hPa</div>
-           <div class="weather-label">Air Pressure</div>
+           <div class="weather-label">Luftdruck</div>
          </div>
         </div>
         
         <div class="section" id="rtc_section">
-         <h2>🕐 Time (RTC)</h2>
+         <h2>🕐 Zeit (RTC)</h2>
          <div style="text-align: center;">
-           <div class="weather-label">Localzeit <span id="dst_label">(MEZ)</span></div>
+           <div class="weather-label">Lokalzeit <span id="dst_label">(MEZ)</span></div>
            <div class="weather-value" style="font-size: 28px;"><span id="rtc_time_local">--:--:--</span></div>
            <div class="weather-label" style="margin-top: 15px;">UTC</div>
            <div class="weather-value" style="font-size: 20px; color: #00AAFF;"><span id="rtc_time_utc">--:--:--</span></div>
            <div class="weather-label" style="margin-top: 10px;"><span id="rtc_date">--.--.----</span></div>
            <div style="margin-top: 15px;">
-             <span style="color: #AAA;">Timezone: UTC</span>
+             <span style="color: #AAA;">Zeitzone: UTC</span>
              <button onclick="adjustTimezone(-1)" style="margin: 0 5px; padding: 5px 15px;">-</button>
              <span id="timezone_offset" style="color: #00FF00; font-size: 20px;">+1</span>
              <button onclick="adjustTimezone(1)" style="margin: 0 5px; padding: 5px 15px;">+</button>
@@ -1428,54 +1445,54 @@ const char settings_html[] PROGMEM = R"rawliteral(
            <div class="weather-value" style="font-size: 20px;"><span id="gps_time">--:--:--</span></div>
            <div class="weather-label"><span id="gps_date">--.--.----</span></div>
            <div style="margin-top: 15px; color: #00AAFF;">
-             Satellites: <span id="gps_sats">0</span> | Fix: <span id="gps_fix">Nein</span>
+             Satelliten: <span id="gps_sats">0</span> | Fix: <span id="gps_fix">Nein</span>
            </div>
          </div>
         </div>
         
-        <!-- Rain Sensor (nur if present) -->
+        <!-- Regensensor (nur wenn vorhanden) -->
         <div class="section" id="rain_section" style="display:none;">
-         <h2>🌧️ Rain Sensor</h2>
+         <h2>🌧️ Regensensor</h2>
          <div style="text-align: center;">
-           <div class="weather-value" id="rain_status">DRY</div>
+           <div class="weather-value" id="rain_status">TROCKEN</div>
            <div class="weather-label">RG-11 Sensor</div>
          </div>
         </div>
         
-        <!-- Heater -->
+        <!-- Heizung -->
         <div class="section">
-         <h2><span id="heater_icon_settings">🔥</span> Heater</h2>
+         <h2><span id="heater_icon_settings">🔥</span> Heizung</h2>
          <div style="text-align: center;">
-           <div class="weather-value" id="heater_status_settings">OFF</div>
+           <div class="weather-value" id="heater_status_settings">AUS</div>
            <div class="weather-label">Status</div>
            <div style="margin-top: 15px; color: #00AAFF;">
-             Dew Point: <span id="dew_point_settings">--</span>°C
+             Taupunkt: <span id="dew_point_settings">--</span>°C
            </div>
            <div style="margin-top: 10px; font-size: 12px; color: #AAA;">
-             Only when closeder Observatory
+             Nur bei geschlossener Sternwarte
            </div>
          </div>
         </div>
         
       </div>
       
-      <!-- Rechte Spalte: Reed Contacts & Servos -->
+      <!-- Rechte Spalte: Reed-Kontakte & Servos -->
       <div class="column-right">
     
         <div class="section">
-          <h2>Status Reed Contacts</h2>
+          <h2>Status Reed-Kontakte</h2>
           <div class="reed-status">
             <div class="reed-item">
               <div id="led1" class="led led-off"></div>
-              <div>Cover<br>geschlossen</div>
+              <div>Klappe<br>geschlossen</div>
             </div>
             <div class="reed-item">
               <div id="led2" class="led led-off"></div>
-              <div>Lock<br>geschlossen</div>
+              <div>Verriegelung<br>geschlossen</div>
             </div>
             <div class="reed-item">
               <div id="led3" class="led led-off"></div>
-              <div>Tube<br>Standby</div>
+              <div>Tubus<br>Standby</div>
             </div>
           </div>
         </div>
@@ -1483,7 +1500,7 @@ const char settings_html[] PROGMEM = R"rawliteral(
         <div class="section">
           <h2>Riegelüberwachung (Reed2)</h2>
           <div style="margin-bottom: 15px; color: #AAA; font-size: 14px;">
-            <strong>Status:</strong> <span id="reed2_status" style="color: #00AAFF;">Enabled</span>
+            <strong>Status:</strong> <span id="reed2_status" style="color: #00AAFF;">Aktiviert</span>
           </div>
           
           <button id="reed2_toggle" onclick="toggleReed2()" style="background:#00AA00; border: 2px solid #00FF00;">
@@ -1491,9 +1508,9 @@ const char settings_html[] PROGMEM = R"rawliteral(
           </button>
           
           <div style="margin-top:15px; color:#888; font-size:12px;">
-            <strong>ℹ️ Note:</strong><br>
-            Bei Problemen mit der Riegelmechanik kann die Überwachung hier deactiveiert werden.<br>
-            Bei deactiveierter Überwachung wird Reed2 ignoriert.
+            <strong>ℹ️ Hinweis:</strong><br>
+            Bei Problemen mit der Riegelmechanik kann die Überwachung hier deaktiviert werden.<br>
+            Bei deaktivierter Überwachung wird Reed2 ignoriert.
           </div>
         </div>
     
@@ -1521,9 +1538,9 @@ const char settings_html[] PROGMEM = R"rawliteral(
              </div>
            </div>
            
-           <!-- Servo 2: Cover (3 Positionen) -->
+           <!-- Servo 2: Klappe (3 Positionen) -->
            <div class="servo-row" style="margin-top: 20px;">
-             <div class="servo-label">Cover</div>
+             <div class="servo-label">Klappe</div>
              <div class="servo-pos"><span id="pos2">90</span>°</div>
              <div class="servo-buttons">
                <button onclick="moveServo(2, -1)">-</button>
@@ -1532,9 +1549,9 @@ const char settings_html[] PROGMEM = R"rawliteral(
            </div>
            <div class="servo-row" style="background-color: #1a1a1a; margin-top: -10px; padding-top: 5px;">
              <div style="flex: 3;">
-               <button onclick="gotoPosition(2, 1)" style="margin: 5px; width: 30%;">Cover closed</button>
-               <button onclick="gotoPosition(2, 2)" style="margin: 5px; width: 30%;">Cover open</button>
-               <button onclick="gotoPosition(2, 3)" style="margin: 5px; width: 30%;">Cover half-open</button>
+               <button onclick="gotoPosition(2, 1)" style="margin: 5px; width: 30%;">Klappe geschlossen</button>
+               <button onclick="gotoPosition(2, 2)" style="margin: 5px; width: 30%;">Klappe offen</button>
+               <button onclick="gotoPosition(2, 3)" style="margin: 5px; width: 30%;">Klappe halboffen</button>
              </div>
              <div style="flex: 1; text-align: right;">
                <button onclick="savePosition(2, 1)" class="small">💾 Pos1</button>
@@ -1543,9 +1560,9 @@ const char settings_html[] PROGMEM = R"rawliteral(
              </div>
            </div>
            
-           <!-- Servo 3: Lock (2 Positionen) -->
+           <!-- Servo 3: Verriegelung (2 Positionen) -->
            <div class="servo-row" style="margin-top: 20px;">
-             <div class="servo-label">Lock</div>
+             <div class="servo-label">Verriegelung</div>
              <div class="servo-pos"><span id="pos3">90</span>°</div>
              <div class="servo-buttons">
                <button onclick="moveServo(3, -1)">-</button>
@@ -1566,25 +1583,25 @@ const char settings_html[] PROGMEM = R"rawliteral(
          </div>
         </div>
         
-        <!-- Sensor Status -->
+        <!-- Sensor-Status -->
         <div class="section">
-         <h2>📡 Sensor Status</h2>
+         <h2>📡 Sensor-Status</h2>
          <div style="text-align: left; font-size: 14px;">
            <div id="sensor_htu" class="sensor-missing">✗ HTU21D/Si7021: Prüfe...</div>
            <div id="sensor_bmp" class="sensor-missing">✗ BMP-Sensor: Prüfe...</div>
            <div id="sensor_rtc" class="sensor-missing">✗ DS3231 RTC: Prüfe...</div>
            <div id="sensor_gps" class="sensor-missing">✗ GPS: Prüfe...</div>
-           <div id="sensor_rain" class="sensor-missing">✗ RG-11 Rain: Prüfe...</div>
+           <div id="sensor_rain" class="sensor-missing">✗ RG-11 Regen: Prüfe...</div>
          </div>
         </div>
         
-        <!-- Erweiterte Settings -->
+        <!-- Erweiterte Einstellungen -->
         <div class="section" style="background:#0a0a0a;">
-          <h2>🔧 Erweiterte Settings</h2>
+          <h2>🔧 Erweiterte Einstellungen</h2>
           <button onclick="location.href='/wifi'" style="width:100%; padding:15px; margin:10px 0; background:#1a5080;">📡 WiFi Konfiguration</button>
           <button onclick="location.href='/seestar'" style="width:100%; padding:15px; margin:10px 0; background:#1a5080;">🔭 Seestar S50</button>
-          <button onclick="location.href='/rain'" style="width:100%; padding:15px; margin:10px 0; background:#1a5080;">🌧️ Rain-Settings</button>
-          <button onclick="location.href='/heater'" style="width:100%; padding:15px; margin:10px 0; background:#1a5080;">♨️ Heater & Dew Point</button>
+          <button onclick="location.href='/rain'" style="width:100%; padding:15px; margin:10px 0; background:#1a5080;">🌧️ Regen-Einstellungen</button>
+          <button onclick="location.href='/heater'" style="width:100%; padding:15px; margin:10px 0; background:#1a5080;">♨️ Heizung & Taupunkt</button>
           <button onclick="location.href='/system'" style="width:100%; padding:15px; margin:10px 0; background:#0066CC;">⚡ System & Version</button>
           <button onclick="location.href='/update'" style="width:100%; padding:15px; margin:10px 0; background:#00AA00;">🔄 Firmware Update</button>
         </div>
@@ -1604,10 +1621,10 @@ const char settings_html[] PROGMEM = R"rawliteral(
       fetch('/status')
         .then(response => response.json())
         .then(data => {
-          // Reed Contacts
+          // Reed-Kontakte
           document.getElementById('led1').className = data.reed1 ? 'led led-on' : 'led led-off';
           
-          // Reed2 only if activeiert, sonst ausgrauen
+          // Reed2 nur wenn aktiviert, sonst ausgrauen
           if (data.reed2_enabled) {
             document.getElementById('led2').className = data.reed2 ? 'led led-on' : 'led led-off';
             document.getElementById('led2').style.opacity = '1.0';
@@ -1625,13 +1642,13 @@ const char settings_html[] PROGMEM = R"rawliteral(
             reed2Toggle.textContent = '✅ Riegelüberwachung AKTIVIERT';
             reed2Toggle.style.background = '#00AA00';
             reed2Toggle.style.borderColor = '#00FF00';
-            reed2Status.textContent = 'Enabled';
+            reed2Status.textContent = 'Aktiviert';
             reed2Status.style.color = '#00FF00';
           } else {
             reed2Toggle.textContent = '❌ Riegelüberwachung DEAKTIVIERT';
             reed2Toggle.style.background = '#AA0000';
             reed2Toggle.style.borderColor = '#FF0000';
-            reed2Status.textContent = 'Disabled';
+            reed2Status.textContent = 'Deaktiviert';
             reed2Status.style.color = '#FF0000';
           }
           
@@ -1640,13 +1657,13 @@ const char settings_html[] PROGMEM = R"rawliteral(
           document.getElementById('pos2').textContent = data.servo2;
           document.getElementById('pos3').textContent = data.servo3;
           
-          // Weather Data
+          // Wetterdaten
           document.getElementById('temp_innen').textContent = data.temp_innen.toFixed(1);
           document.getElementById('hum_innen').textContent = data.hum_innen.toFixed(0);
           document.getElementById('temp_aussen').textContent = data.temp_aussen.toFixed(1);
           document.getElementById('druck_aussen').textContent = data.druck_aussen.toFixed(0);
           
-          // RTC Time
+          // RTC Zeit
           document.getElementById('rtc_time_local').textContent = data.rtc_time_local;
           document.getElementById('rtc_time_utc').textContent = data.rtc_time_utc;
           document.getElementById('rtc_date').textContent = data.rtc_date;
@@ -1676,7 +1693,7 @@ const char settings_html[] PROGMEM = R"rawliteral(
             satIcon.style.textShadow = 'none';
           }
           
-          // Rain Sensor (nur if present)
+          // Regensensor (nur wenn vorhanden)
           if (data.rain_sensor_present) {
             document.getElementById('rain_section').style.display = 'block';
             const rainStatus = document.getElementById('rain_status');
@@ -1685,12 +1702,12 @@ const char settings_html[] PROGMEM = R"rawliteral(
               rainStatus.textContent = 'REGEN!';
               rainStatus.style.color = '#FF0000';
             } else {
-              rainStatus.textContent = 'DRY';
+              rainStatus.textContent = 'TROCKEN';
               rainStatus.style.color = '#00FF00';
             }
           }
           
-          // Heater
+          // Heizung
           const heaterStatusSettings = document.getElementById('heater_status_settings');
           const heaterIconSettings = document.getElementById('heater_icon_settings');
           const dewPointSettings = document.getElementById('dew_point_settings');
@@ -1709,8 +1726,8 @@ const char settings_html[] PROGMEM = R"rawliteral(
             heaterIconSettings.style.textShadow = 'none';
           }
           
-          // Sensor Status aktualisieren
-          // HTU21D - prüfe ob Temperature sinnvoll ist
+          // Sensor-Status aktualisieren
+          // HTU21D - prüfe ob Temperatur sinnvoll ist
           if (data.temp_innen > -50 && data.temp_innen < 100) {
             document.getElementById('sensor_htu').className = 'sensor-found';
             document.getElementById('sensor_htu').textContent = '✓ HTU21D/Si7021: OK';
@@ -1743,23 +1760,23 @@ const char settings_html[] PROGMEM = R"rawliteral(
             document.getElementById('sensor_gps').className = 'sensor-found';
             document.getElementById('sensor_gps').textContent = '✓ GPS: OK (' + data.gps_sats + ' Sats)';
           } else if (data.gps_sats > 0) {
-            // GPS empfängt Satellites, aber kein Fix
+            // GPS empfängt Satelliten, aber kein Fix
             document.getElementById('sensor_gps').className = 'sensor-missing';
             document.getElementById('sensor_gps').textContent = '✗ GPS: Kein Fix (' + data.gps_sats + ' Sats)';
           } else {
-            // 0 Satellites - GPS sucht noch oder nicht angeschlossen
-            // Wir können nicht unterscheiden, also zeigen wir "Sucht Satellites"
+            // 0 Satelliten - GPS sucht noch oder nicht angeschlossen
+            // Wir können nicht unterscheiden, also zeigen wir "Sucht Satelliten"
             document.getElementById('sensor_gps').className = 'sensor-missing';
-            document.getElementById('sensor_gps').textContent = '⚠ GPS: Sucht Satellites... (0 Sats)';
+            document.getElementById('sensor_gps').textContent = '⚠ GPS: Sucht Satelliten... (0 Sats)';
           }
           
-          // Rain Sensor
+          // Regensensor
           if (data.rain_sensor_present) {
             document.getElementById('sensor_rain').className = 'sensor-found';
-            document.getElementById('sensor_rain').textContent = '✓ RG-11 Rain: OK';
+            document.getElementById('sensor_rain').textContent = '✓ RG-11 Regen: OK';
           } else {
             document.getElementById('sensor_rain').className = 'sensor-missing';
-            document.getElementById('sensor_rain').textContent = '✗ RG-11 Rain: Nicht gefunden';
+            document.getElementById('sensor_rain').textContent = '✗ RG-11 Regen: Nicht gefunden';
           }
           
           
@@ -1773,7 +1790,7 @@ const char settings_html[] PROGMEM = R"rawliteral(
             errorBox.style.display = 'none';
           }
           
-          // Rain-Schließung Info (falls vorhanden)
+          // Regen-Schließung Info (falls vorhanden)
           const rainCloseBox = document.getElementById('rain_close_info');
           const rainCloseTime = document.getElementById('rain_close_time');
           if (data.last_rain_close && data.last_rain_close !== '') {
@@ -1814,10 +1831,10 @@ const char settings_html[] PROGMEM = R"rawliteral(
         fetch('/save?servo=' + servo + '&pos=' + pos)
           .then(response => {
             if (response.ok) {
-              console.log('Position saved');
+              console.log('Position gespeichert');
             }
           })
-          .catch(e => console.error('Error:', e));
+          .catch(e => console.error('Fehler:', e));
       }
     }
     
@@ -1890,7 +1907,7 @@ const char system_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <button class="home-btn" onclick="location.href='/settings'">⬅️ Back</button>
+  <button class="home-btn" onclick="location.href='/settings'">⬅️ Zurück</button>
   
   <div class="container">
     <h1>⚡ System</h1>
@@ -1898,7 +1915,7 @@ const char system_html[] PROGMEM = R"rawliteral(
     <div class="section">
       <h2>Firmware</h2>
       <div class="version" id="fw_version">v0.1</div>
-      <div class="info" style="text-align:center;">S50 Observatory Control</div>
+      <div class="info" style="text-align:center;">S50 Sternwarten-Steuerung</div>
     </div>
     
     <div class="section" style="background:#1a0a00; border-color:#FF6600;">
@@ -1913,7 +1930,7 @@ const char system_html[] PROGMEM = R"rawliteral(
     <div class="section">
       <h2>Aktionen</h2>
       
-      <button onclick="loadDefaults()" style="background:#8B0000; margin-top:10px;">🔄 Defaultwerte laden</button>
+      <button onclick="loadDefaults()" style="background:#8B0000; margin-top:10px;">🔄 Standardwerte laden</button>
       <div class="info">Alle Servo-Winkel → 90° (WiFi bleibt erhalten)</div>
     </div>
   </div>
@@ -1927,7 +1944,7 @@ const char system_html[] PROGMEM = R"rawliteral(
       });
     
     function loadDefaults() {
-      if (confirm('WARNUNG!\n\nAlle Servo-Winkel werden auf 90° zurückgesetzt!\n\nWiFi und Timezone bleiben erhalten.\n\nFortfahren?')) {
+      if (confirm('WARNUNG!\n\nAlle Servo-Winkel werden auf 90° zurückgesetzt!\n\nWiFi und Zeitzone bleiben erhalten.\n\nFortfahren?')) {
         fetch('/system/defaults', {
           method: 'GET',
           headers: {'Accept': 'text/plain'}
@@ -1937,11 +1954,11 @@ const char system_html[] PROGMEM = R"rawliteral(
             return r.text();
           })
           .then(t => {
-            alert('Defaults loaded!\n\nAlle Servo-Winkel auf 90°');
+            alert('Defaults geladen!\n\nAlle Servo-Winkel auf 90°');
           })
           .catch(e => {
             console.error('Defaults Error:', e);
-            alert('Defaults loaded!\n(Response-Fehler ignorieren)');
+            alert('Defaults geladen!\n(Response-Fehler ignorieren)');
           });
       }
     }
@@ -2007,7 +2024,7 @@ const char wifi_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <button class="home-btn" onclick="location.href='/settings'">⬅️ Back</button>
+  <button class="home-btn" onclick="location.href='/settings'">⬅️ Zurück</button>
   
   <div class="container">
     <h1>📡 WiFi Konfiguration</h1>
@@ -2115,7 +2132,7 @@ const char seestar_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <button class="home-btn" onclick="location.href='/settings'">⬅️ Back</button>
+  <button class="home-btn" onclick="location.href='/settings'">⬅️ Zurück</button>
   
   <div class="container">
     <h1>🔭 Seestar S50</h1>
@@ -2127,23 +2144,23 @@ const char seestar_html[] PROGMEM = R"rawliteral(
           <span id="seestar_status" class="status-offline">OFFLINE</span>
         </div>
         <div>
-          <strong>IP Address:</strong> <span id="seestar_ip_display">--</span>
+          <strong>IP-Adresse:</strong> <span id="seestar_ip_display">--</span>
         </div>
         <div style="margin-top: 10px; color: #AAA; font-size: 12px;">
-          Ping check every 5 seconds
+          Ping-Check alle 5 Sekunden
         </div>
       </div>
     </div>
     
     <div class="section">
-      <h2>Change IP Address</h2>
-      <label style="color:#AAA;">Seestar S50 IP Address:</label>
+      <h2>IP-Adresse ändern</h2>
+      <label style="color:#AAA;">Seestar S50 IP-Adresse:</label>
       <input type="text" id="new_seestar_ip" placeholder="192.168.1.100">
       
-      <button onclick="saveSeestarIP()" style="background:#0066CC; margin-top:15px;">💾 Save</button>
+      <button onclick="saveSeestarIP()" style="background:#0066CC; margin-top:15px;">💾 Speichern</button>
       
       <div style="margin-top: 10px; color: #AAA; font-size: 12px;">
-        No restart required - active immediately
+        Kein Neustart nötig - wird sofort aktiv
       </div>
     </div>
   </div>
@@ -2173,13 +2190,13 @@ const char seestar_html[] PROGMEM = R"rawliteral(
       const ip = document.getElementById('new_seestar_ip').value;
       
       if (!ip) {
-        alert('Please IP-Adresse eingeben!');
+        alert('Bitte IP-Adresse eingeben!');
         return;
       }
       
       const ipPattern = /^(\d{1,3}\.){3}\d{1,3}$/;
       if (!ipPattern.test(ip)) {
-        alert('Invalide IP-Adresse!');
+        alert('Ungültige IP-Adresse!');
         return;
       }
       
@@ -2187,13 +2204,13 @@ const char seestar_html[] PROGMEM = R"rawliteral(
         .then(response => response.text())
         .then(text => {
           console.log('Server Response:', text);
-          alert('✅ Seestar IP saved!\n\n' + ip);
+          alert('✅ Seestar IP gespeichert!\n\n' + ip);
           document.getElementById('new_seestar_ip').value = '';
           setTimeout(updateStatus, 500);
         })
         .catch(e => {
-          console.error('Error:', e);
-          alert('❌ Fehler beim Save!\n\n' + e.message);
+          console.error('Fehler:', e);
+          alert('❌ Fehler beim Speichern!\n\n' + e.message);
         });
     }
   </script>
@@ -2208,7 +2225,7 @@ const char rain_html[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Rain - S50</title>
+  <title>Regen - S50</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -2266,36 +2283,19 @@ const char rain_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <button class="home-btn" onclick="location.href='/settings'">⬅️ Back</button>
+  <button class="home-btn" onclick="location.href='/settings'">⬅️ Zurück</button>
   
   <div class="container">
-    <h1>🌧️ Rain-Settings</h1>
+    <h1>🌧️ Regen-Einstellungen</h1>
     
     <div class="section">
       <h2>Aktueller Status</h2>
       <div style="text-align: center;">
         <div id="rain_present" style="color: #888; margin: 10px 0;">Prüfe Sensor...</div>
         <div id="current_status" class="value">--</div>
-        <div style="margin: 20px 0;">
-          <div style="color: #AAA;">Intensität:</div>
-          <div class="value" id="current_rate">0.0 mm/h</div>
+        <div style="color: #AAA; margin-top: 20px;">
+          Menge: <span id="current_acc" style="color: #FFF; font-size: 20px;">0.00 mm</span>
         </div>
-        <div style="color: #AAA;">
-          Akkumuliert: <span id="current_acc" style="color: #FFF;">0.00 mm</span>
-        </div>
-      </div>
-    </div>
-    
-    <div class="section">
-      <h2>Schwellwert</h2>
-      <label style="color:#AAA;">Close bei Rain ab (mm/h):</label>
-      <input type="number" id="threshold_input" step="0.1" min="0.1" max="10.0" placeholder="0.5">
-      
-      <button onclick="saveThreshold()" style="background:#0066CC; margin-top:15px;">💾 Save</button>
-      
-      <div class="info">
-        Recommended: 0.5 mm/h (leichter Rain)<br>
-        Bei Überschreitung: Automatic Emergency close
       </div>
     </div>
   </div>
@@ -2319,11 +2319,10 @@ const char rain_html[] PROGMEM = R"rawliteral(
               statusDiv.textContent = 'REGEN!';
               statusDiv.style.color = '#FF0000';
             } else {
-              statusDiv.textContent = 'DRY';
+              statusDiv.textContent = 'TROCKEN';
               statusDiv.style.color = '#00FF00';
             }
             
-            document.getElementById('current_rate').textContent = d.rain_rate.toFixed(1) + ' mm/h';
             document.getElementById('current_acc').textContent = d.rain_acc.toFixed(2) + ' mm';
           } else {
             presentDiv.textContent = '✗ Kein RG-11 Sensor erkannt';
@@ -2331,28 +2330,7 @@ const char rain_html[] PROGMEM = R"rawliteral(
             statusDiv.textContent = 'N/A';
             statusDiv.style.color = '#888';
           }
-          
-          // Aktuellen Schwellwert anzeigen
-          document.getElementById('threshold_input').placeholder = d.rain_threshold.toFixed(1);
         });
-    }
-    
-    function saveThreshold() {
-      const val = parseFloat(document.getElementById('threshold_input').value);
-      
-      if (isNaN(val) || val < 0.1 || val > 10.0) {
-        alert('Invalider Wert! Please 0.1 - 10.0 mm/h eingeben.');
-        return;
-      }
-      
-      fetch('/rain/threshold?value=' + val)
-        .then(response => {
-          if (response.ok) {
-            document.getElementById('threshold_input').value = '';
-            updateStatus();
-          }
-        })
-        .catch(e => console.error('Error:', e));
     }
   </script>
 </body>
@@ -2366,7 +2344,7 @@ const char heater_html[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Heater - S50</title>
+  <title>Heizung - S50</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -2431,10 +2409,10 @@ const char heater_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <button class="home-btn" onclick="location.href='/settings'">⬅️ Back</button>
+  <button class="home-btn" onclick="location.href='/settings'">⬅️ Zurück</button>
   
   <div class="container">
-    <h1>♨️ Heater & Dew Point</h1>
+    <h1>♨️ Heizung & Taupunkt</h1>
     
     <div class="section">
       <h2>Aktueller Status</h2>
@@ -2445,59 +2423,59 @@ const char heater_html[] PROGMEM = R"rawliteral(
         </div>
         
         <div style="margin: 20px 0; padding: 15px; background: #0a0a0a; border-radius: 10px;">
-          <div style="color: #AAA; margin-bottom: 5px;">Outside temperatur</div>
+          <div style="color: #AAA; margin-bottom: 5px;">Außentemperatur</div>
           <div class="value" id="temp_outside">--°C</div>
         </div>
         
         <div style="margin: 20px 0; padding: 15px; background: #0a0a0a; border-radius: 10px;">
-          <div style="color: #AAA; margin-bottom: 5px;">Dew Point</div>
+          <div style="color: #AAA; margin-bottom: 5px;">Taupunkt</div>
           <div class="value" id="dew_point">--°C</div>
           <div style="color: #888; font-size: 12px; margin-top: 5px;">
-            Berechnet aus Inside temp & Luftfeuchte
+            Berechnet aus Innentemp & Luftfeuchte
           </div>
         </div>
         
         <div id="sensor_warning" style="display:none; color:#FF6600; margin-top:15px;">
-          ⚠️ BMP180 Außensensor fehlt - Heater deactiveiert
+          ⚠️ BMP180 Außensensor fehlt - Heizung deaktiviert
         </div>
       </div>
     </div>
     
     <div class="section">
-      <h2>Heater Steuerung</h2>
+      <h2>Heizungs-Steuerung</h2>
       <div style="margin-bottom: 15px; color: #AAA; font-size: 14px;">
-        <strong>Status:</strong> <span id="current_mode" style="color: #00AAFF;">Enabled</span>
+        <strong>Status:</strong> <span id="current_mode" style="color: #00AAFF;">Aktiviert</span>
       </div>
       
       <button id="heater_toggle" onclick="toggleHeaterMode()" style="background:#0066CC; border: 2px solid #00FF00;">
-        ✅ Heater AKTIVIERT
+        ✅ Heizung AKTIVIERT
       </button>
       
       <div class="info">
-        <strong>Automatic Dew Point Heater:</strong><br>
-        • Heater switches automatically when Inside temp ≤ Dew Point<br>
-        • Only when closeder Observatory active<br>
-        • With this button you can the automatic komplett deactiveieren
+        <strong>Automatische Taupunkt-Heizung:</strong><br>
+        • Heizung schaltet automatisch wenn Innentemp ≤ Taupunkt<br>
+        • Nur bei geschlossener Sternwarte aktiv<br>
+        • Mit diesem Button kannst du die Automatik komplett deaktivieren
       </div>
     </div>
     
     <div class="section">
-      <h2>Dew Point-Hysteresis</h2>
+      <h2>Taupunkt-Hysterese</h2>
       <div style="margin-bottom: 15px; color: #AAA; font-size: 14px;">
         <strong>Aktuell:</strong> <span id="current_hysteresis" style="color: #00AAFF;">2.0</span> °C
       </div>
       
-      <label style="color:#AAA;">Hysteresis (°C):</label>
+      <label style="color:#AAA;">Hysterese (°C):</label>
       <input type="number" id="hysteresis_input" step="0.5" min="0.5" max="10.0" placeholder="2.0">
       
-      <button onclick="saveHysteresis()" style="background:#0066CC; margin-top:15px;">💾 Save</button>
+      <button onclick="saveHysteresis()" style="background:#0066CC; margin-top:15px;">💾 Speichern</button>
       
       <div class="info">
-        <strong>How does it work?</strong><br>
-        • Heater ON: Inside temp ≤ Dew Point<br>
-        • Heater OFF: Inside temp > Dew Point + Hysteresis<br><br>
-        <strong>Recommended:</strong> 2.0°C (prevents frequent switching)<br>
-        <strong>Default:</strong> ±2°C (Industrie-Default for telescopes)
+        <strong>Wie funktioniert es?</strong><br>
+        • Heizung AN: Innentemp ≤ Taupunkt<br>
+        • Heizung AUS: Innentemp > Taupunkt + Hysterese<br><br>
+        <strong>Empfohlen:</strong> 2.0°C (verhindert häufiges Schalten)<br>
+        <strong>Standard:</strong> ±2°C (Industrie-Standard für Teleskope)
       </div>
     </div>
   </div>
@@ -2514,56 +2492,56 @@ const char heater_html[] PROGMEM = R"rawliteral(
           const heaterStatus = document.getElementById('heater_status');
           const sensorWarning = document.getElementById('sensor_warning');
           
-          // Heater Status LED
+          // Heizungs-Status LED
           if (d.heater_on) {
             heaterLed.style.background = '#FF6600';
-            heaterStatus.textContent = 'HEIZUNG ON';
+            heaterStatus.textContent = 'HEIZUNG AN';
             heaterStatus.style.color = '#FF6600';
           } else {
             heaterLed.style.background = '#888';
-            heaterStatus.textContent = 'HEIZUNG OFF';
+            heaterStatus.textContent = 'HEIZUNG AUS';
             heaterStatus.style.color = '#888';
           }
           
-          // Temperatures
+          // Temperaturen
           document.getElementById('temp_outside').textContent = d.temp_aussen.toFixed(1) + '°C';
           document.getElementById('dew_point').textContent = d.dew_point.toFixed(1) + '°C';
           
-          // Sensor-Warning
+          // Sensor-Warnung
           if (!d.bmp_sensor_present) {
             sensorWarning.style.display = 'block';
-            sensorWarning.textContent = 'ℹ️ BMP-Sensor fehlt - Outside temperatur nicht verfügbar';
+            sensorWarning.textContent = 'ℹ️ BMP-Sensor fehlt - Außentemperatur nicht verfügbar';
           } else {
             sensorWarning.style.display = 'none';
           }
           
-          // Heater Toggle Button
+          // Heizungs-Toggle Button
           const toggleBtn = document.getElementById('heater_toggle');
           const modeText = document.getElementById('current_mode');
           
           if (d.heater_mode === 0) {
-            // Enabled
-            toggleBtn.textContent = '✅ Heater AKTIVIERT';
+            // Aktiviert
+            toggleBtn.textContent = '✅ Heizung AKTIVIERT';
             toggleBtn.style.background = '#00AA00';
             toggleBtn.style.borderColor = '#00FF00';
-            modeText.textContent = 'Enabled';
+            modeText.textContent = 'Aktiviert';
             modeText.style.color = '#00FF00';
           } else {
-            // Disabled
-            toggleBtn.textContent = '❌ Heater DEAKTIVIERT';
+            // Deaktiviert
+            toggleBtn.textContent = '❌ Heizung DEAKTIVIERT';
             toggleBtn.style.background = '#AA0000';
             toggleBtn.style.borderColor = '#FF0000';
-            modeText.textContent = 'Disabled';
+            modeText.textContent = 'Deaktiviert';
             modeText.style.color = '#FF0000';
           }
           
-          // Hysteresis
+          // Hysterese
           document.getElementById('current_hysteresis').textContent = d.heater_hysteresis.toFixed(1);
         });
     }
     
     function toggleHeaterMode() {
-      // Toggle zwischen 0 (Enabled) und 1 (Disabled)
+      // Toggle zwischen 0 (Aktiviert) und 1 (Deaktiviert)
       fetch('/status?t=' + Date.now())
         .then(r => r.json())
         .then(d => {
@@ -2577,7 +2555,7 @@ const char heater_html[] PROGMEM = R"rawliteral(
       const val = parseFloat(document.getElementById('hysteresis_input').value);
       
       if (isNaN(val) || val < 0.5 || val > 10.0) {
-        alert('Invalider Wert! Please 0.5 - 10.0 °C eingeben.');
+        alert('Ungültiger Wert! Bitte 0.5 - 10.0 °C eingeben.');
         return;
       }
       
@@ -2597,7 +2575,7 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Scheduler - S50</title>
+  <title>Zeitplaner - S50</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -2705,48 +2683,48 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <button class="home-btn" onclick="location.href='/'">⬅️ Back</button>
+  <button class="home-btn" onclick="location.href='/'">⬅️ Zurück</button>
   
   <div class="container">
-    <h1>⏰ Scheduler</h1>
+    <h1>⏰ Zeitplaner</h1>
     
     <div class="section">
       <h2>Status</h2>
       <div class="toggle">
-        <span style="font-size: 16px;">Scheduler activeiert</span>
+        <span style="font-size: 16px;">Zeitplaner aktiviert</span>
         <label class="switch">
           <input type="checkbox" id="scheduler_toggle">
           <span class="slider"></span>
         </label>
       </div>
       <div id="next_action" style="text-align: center; color: #00AAFF; margin-top: 15px; font-size: 14px;">
-        Loading...
+        Lädt...
       </div>
     </div>
     
     <div class="section" style="background: #0a1a0a; border-color: #00AA00;">
-      <h2 style="color: #00FF00;">✅ Gespeicherte Timeen</h2>
+      <h2 style="color: #00FF00;">✅ Gespeicherte Zeiten</h2>
       <div id="saved_times" style="text-align: center; font-size: 16px; color: #AAA; padding: 10px;">
-        Loading...
+        Lädt...
       </div>
     </div>
     
     <div class="section">
-      <h2>⬆️ Open</h2>
-      <label style="color:#AAA;">Time:</label>
+      <h2>⬆️ Öffnen</h2>
+      <label style="color:#AAA;">Uhrzeit:</label>
       <div class="time-input">
         <input type="number" id="open_hour" min="0" max="23" placeholder="20">
         <span style="font-size: 20px;">:</span>
         <input type="number" id="open_min" min="0" max="59" placeholder="00">
       </div>
       <div class="info">
-        ⚠️ Öffnung wird bei Rain automatisch abgebrochen
+        ⚠️ Öffnung wird bei Regen automatisch abgebrochen
       </div>
     </div>
     
     <div class="section">
-      <h2>⬇️ Close</h2>
-      <label style="color:#AAA;">Time:</label>
+      <h2>⬇️ Schließen</h2>
+      <label style="color:#AAA;">Uhrzeit:</label>
       <div class="time-input">
         <input type="number" id="close_hour" min="0" max="23" placeholder="03">
         <span style="font-size: 20px;">:</span>
@@ -2754,20 +2732,20 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
       </div>
     </div>
     
-    <button onclick="saveSchedule()" style="background:#0066CC; margin-top:15px;">💾 Save</button>
+    <button onclick="saveSchedule()" style="background:#0066CC; margin-top:15px;">💾 Speichern</button>
     
     <div class="info" style="margin-top: 20px; padding: 15px; background: #0a0a0a; border-radius: 10px;">
-      <strong>💡 How does it work?</strong><br>
-      • Planer nutzt RTC-Time (GPS-synchronisiert)<br>
-      • Täglich zur eingestellten Time<br>
-      • Open wird bei Rain verhindert<br>
-      • Close läuft immer (außer Tube active)<br><br>
+      <strong>💡 Wie funktioniert es?</strong><br>
+      • Planer nutzt RTC-Zeit (GPS-synchronisiert)<br>
+      • Täglich zur eingestellten Uhrzeit<br>
+      • Öffnen wird bei Regen verhindert<br>
+      • Schließen läuft immer (außer Tubus aktiv)<br><br>
       <strong>Beispiel:</strong> Wie Seestar S50 - Session von 20:00 bis 03:00 Uhr
     </div>
   </div>
 
   <script>
-    // Lade EINMAL beim Open der Seite
+    // Lade EINMAL beim Öffnen der Seite
     loadSchedule();
     
     function loadSchedule() {
@@ -2794,8 +2772,8 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
                         String(d.schedule_close_min).padStart(2, '0');
       
       savedDiv.innerHTML = `
-        <strong>Open:</strong> ${openTime} Uhr &nbsp;|&nbsp; 
-        <strong>Close:</strong> ${closeTime} Uhr
+        <strong>Öffnen:</strong> ${openTime} Uhr &nbsp;|&nbsp; 
+        <strong>Schließen:</strong> ${closeTime} Uhr
       `;
       savedDiv.style.color = '#00FF00';
     }
@@ -2804,7 +2782,7 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
       const nextDiv = document.getElementById('next_action');
       
       if (!d.scheduler_enabled) {
-        nextDiv.textContent = '⏸️ Scheduler deactiveiert';
+        nextDiv.textContent = '⏸️ Zeitplaner deaktiviert';
         nextDiv.style.color = '#888';
         return;
       }
@@ -2815,7 +2793,7 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
                         String(d.schedule_close_min).padStart(2, '0');
       
       nextDiv.innerHTML = `
-        ✅ Scheduler active<br>
+        ✅ Zeitplaner aktiv<br>
         Öffnet täglich um ${openTime} Uhr | Schließt um ${closeTime} Uhr
       `;
       nextDiv.style.color = '#00FF00';
@@ -2831,7 +2809,7 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
       console.log('Speichere:', {enabled, oh, om, ch, cm});
       
       if (oh < 0 || oh > 23 || om < 0 || om > 59 || ch < 0 || ch > 23 || cm < 0 || cm > 59) {
-        alert('Invalide Timeangabe!');
+        alert('Ungültige Zeitangabe!');
         return;
       }
       
@@ -2874,11 +2852,11 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
           updateSavedTimes(newData);
           updateNextAction(newData);
           
-          alert('✅ Scheduler saved!\n\n' +
-                'Open: ' + openTime + ' Uhr\n' +
-                'Close: ' + closeTime + ' Uhr\n' +
-                'Status: ' + (enabled ? 'Aktiv ✅' : 'Inactive ⏸️') + '\n\n' +
-                'Seite wird neu loaded...');
+          alert('✅ Zeitplaner gespeichert!\n\n' +
+                'Öffnen: ' + openTime + ' Uhr\n' +
+                'Schließen: ' + closeTime + ' Uhr\n' +
+                'Status: ' + (enabled ? 'Aktiv ✅' : 'Inaktiv ⏸️') + '\n\n' +
+                'Seite wird neu geladen...');
           
           // Lade nach 1 Sekunde neu vom Server
           setTimeout(() => {
@@ -2888,7 +2866,7 @@ const char scheduler_html[] PROGMEM = R"rawliteral(
         })
         .catch(e => {
           console.error('Save Error:', e);
-          alert('Fehler beim Save:\n' + e);
+          alert('Fehler beim Speichern:\n' + e);
         });
     }
   </script>
@@ -2986,7 +2964,7 @@ const char update_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <button class="home-btn" onclick="location.href='/settings'">⬅️ Back</button>
+  <button class="home-btn" onclick="location.href='/settings'">⬅️ Zurück</button>
   
   <div class="container">
     <h1>🔄 Firmware Update</h1>
@@ -3023,7 +3001,7 @@ const char update_html[] PROGMEM = R"rawliteral(
         <strong>3.</strong> "Update starten" klicken<br><br>
         <strong>4.</strong> Warten bis Update abgeschlossen<br><br>
         <strong>5.</strong> ESP32 startet automatisch neu<br><br>
-        ⏱️ Update dauert ca. 30-60 seconds
+        ⏱️ Update dauert ca. 30-60 Sekunden
       </div>
     </div>
   </div>
@@ -3043,7 +3021,7 @@ const char update_html[] PROGMEM = R"rawliteral(
       const file = fileInput.files[0];
       
       if (!file) {
-        alert('Please .bin Datei auswählen!');
+        alert('Bitte .bin Datei auswählen!');
         return;
       }
       
@@ -3080,9 +3058,9 @@ const char update_html[] PROGMEM = R"rawliteral(
         if (xhr.status === 200) {
           progressBar.style.width = '100%';
           progressBar.textContent = '100%';
-          statusMessage.innerHTML = '<div style="color:#00FF00; font-size:18px;">✅ Update erfolgreich!<br><br>ESP32 startet neu...<br><br>Please 30 seconds warten!</div>';
+          statusMessage.innerHTML = '<div style="color:#00FF00; font-size:18px;">✅ Update erfolgreich!<br><br>ESP32 startet neu...<br><br>Bitte 30 Sekunden warten!</div>';
           
-          // Nach 30 seconds neu laden
+          // Nach 30 Sekunden neu laden
           setTimeout(function() {
             location.href = '/';
           }, 30000);
@@ -3156,7 +3134,7 @@ void setup() {
   esp_log_level_set("i2c", ESP_LOG_NONE);         // I2C komplett aus
   esp_log_level_set("i2c.master", ESP_LOG_NONE);  // I2C Master aus
   
-  Serial.printf("\n=== S50 Observatory Control v%s ===\n", FIRMWARE_VERSION);
+  Serial.printf("\n=== S50 Sternwarten-Steuerung v%s ===\n", FIRMWARE_VERSION);
   
   // LittleFS für Bilder
   if (!LittleFS.begin(true)) {
@@ -3192,14 +3170,14 @@ void setup() {
     Serial.println("✓ BMP180 Sensor gefunden!");
     Serial.println("   I2C-Adresse: 0x77");
   } 
-  // Nonen gefunden
+  // Keinen gefunden
   else {
     bmp180_present = false;
     bmp280_present = false;
-    bmp_sensor_type = "None";
+    bmp_sensor_type = "Keine";
     Serial.println("✗ Kein BMP-Sensor gefunden!");
     Serial.println("   → Prüfe I2C-Verkabelung (SDA=21, SCL=22)");
-    Serial.println("   → Heater wird deactiveiert (keine Outside temperatur)");
+    Serial.println("   → Heizung wird deaktiviert (keine Außentemperatur)");
   }
   delay(500);
   
@@ -3217,7 +3195,7 @@ void setup() {
       DateTime now = rtc.now();
       Serial.println("✓ DS3231 RTC gefunden und funktioniert!");
       Serial.printf("   I2C-Adresse: 0x68\n");
-      Serial.printf("   Aktuelle Time: %02d.%02d.%04d %02d:%02d:%02d\n",
+      Serial.printf("   Aktuelle Zeit: %02d.%02d.%04d %02d:%02d:%02d\n",
                     now.day(), now.month(), now.year(),
                     now.hour(), now.minute(), now.second());
       Serial.println("   RTC wird automatisch per GPS synchronisiert.");
@@ -3231,9 +3209,9 @@ void setup() {
   } else {
     rtc_present = false;
     Serial.println("✗ DS3231 RTC nicht gefunden!");
-    Serial.println("   None Antwort auf I2C-Adresse 0x68");
+    Serial.println("   Keine Antwort auf I2C-Adresse 0x68");
     Serial.println("   → Prüfe I2C-Verkabelung (SDA=21, SCL=22)");
-    Serial.println("   → Time läuft per millis(), wird per GPS synchronisiert");
+    Serial.println("   → Zeit läuft per millis(), wird per GPS synchronisiert");
   }
   delay(500);
   
@@ -3241,49 +3219,84 @@ void setup() {
   gpsSerial.begin(9600, SERIAL_8N1, 13, 14);
   Serial.println("GPS initialisiert (UART2: RX=13, TX=14, 9600 Baud)");
   
-  // Reed Contacts
+  // Reed-Kontakte
   pinMode(REED1_PIN, INPUT_PULLUP);
   pinMode(REED2_PIN, INPUT_PULLUP);
   pinMode(REED3_PIN, INPUT_PULLUP);
   
-  // Heater
+  // Heizung
   pinMode(HEATER_PIN, OUTPUT);
   digitalWrite(HEATER_PIN, LOW);
-  Serial.println("Heater initialisiert (GPIO 33)");
+  Serial.println("Heizung initialisiert (GPIO 33)");
   
-  // RG-11 Rain Sensor (UART)
+  // RG-11 Regensensor (UART)
+  // WICHTIG: 1200 Baud, Signal INVERTIERT (RS232)
+  // 
+  // HARDWARE:
+  // - DIP Switch 5 am RG-11 muss AUS sein! (sonst kein RS-232)
+  // - Direktverbindung RG-11 TX (Pin 3) → ESP32 GPIO 35 (RX)
+  // 
+  // Protokoll: ASCII-HEX
+  // Frame: 's' + 18 HEX-ASCII Zeichen = 9 Register
+  // RG-11 ASCII Mode: "Acc X.XX\r\n" bei 9600 Baud
+  // DIP 1,2,7 = ON (It's Raining Mode)
   rainSerial.begin(9600, SERIAL_8N1, RAIN_RX_PIN, RAIN_TX_PIN);
-  Serial.println("RG-11 UART initialisiert (RX=35, TX=36, 9600 Baud)");
+  
+  // KEINE Invertierung mehr (ASCII Mode)
+  
+  Serial.println("RG-11 UART initialisiert (RX=35, 9600 Baud, ASCII Mode)");
   delay(500);
   
   // Auto-Detect: Prüfe auf valide RG-11 Daten
-  Serial.print("Suche RG-11... ");
+  Serial.print("Suche RG-11 (Frame: 's' + 18 HEX-ASCII)... ");
   unsigned long start = millis();
-  String buffer = "";
+  char buffer[32];
+  int buf_pos = 0;
   bool valid_data_found = false;
+  int rx_count = 0;
+  int acc_count = 0;
   
-  while (millis() - start < 5000 && !valid_data_found) {
+  Serial.println("  Warte auf RG-11 ASCII Daten (max 10s)...");
+  
+  while (millis() - start < 10000 && !valid_data_found) {  // 10s Timeout
     while (rainSerial.available()) {
       char c = rainSerial.read();
+      rx_count++;
       
-      if (c == '\n' || c == '\r') {
-        // Prüfe ob valides RG-11 Protokoll
-        if (buffer.startsWith("Acc ") || buffer.startsWith("RInt ") || buffer.startsWith("EventAcc")) {
+      // Zeichen in Buffer sammeln
+      if (buf_pos < 31) {
+        buffer[buf_pos++] = c;
+        buffer[buf_pos] = 0;
+      }
+      
+      // Bei \n → Frame komplett, prüfe auf "Acc"
+      if (c == '\n') {
+        if (strstr(buffer, "Acc") != NULL) {
+          acc_count++;
+          Serial.print("\n  'Acc' Frame gefunden: ");
+          Serial.println(buffer);
           valid_data_found = true;
           break;
         }
-        buffer = "";
-      } else {
-        buffer += c;
-        if (buffer.length() > 50) buffer = "";
+        // Buffer zurücksetzen
+        buf_pos = 0;
+        buffer[0] = 0;
+      }
+      
+      // Buffer overflow vermeiden
+      if (buf_pos >= 31) {
+        buf_pos = 0;
+        buffer[0] = 0;
       }
     }
     delay(100);
   }
   
+  Serial.printf("\n  Bytes empfangen: %d, 'Acc' gefunden: %d Mal\n", rx_count, acc_count);
+  
   if (valid_data_found) {
     rain_sensor_present = true;
-    Serial.println("✓ RG-11 Rain Sensor erkannt!");
+    Serial.println("✓ RG-11 Regensensor erkannt!");
   } else {
     Serial.println("Kein RG-11 erkannt (optional)");
   }
@@ -3310,26 +3323,23 @@ void setup() {
   
   timezone_offset = preferences.getInt("timezone", 1);
   
-  rain_threshold = preferences.getFloat("rain_thresh", RAIN_THRESHOLD);
-  Serial.printf("Rain threshold: %.1f mm/h\n", rain_threshold);
-  
   heater_hysteresis = preferences.getFloat("heater_hyst", 2.0);
-  Serial.printf("Heater Hysteresis: %.1f °C\n", heater_hysteresis);
+  Serial.printf("Heizungs-Hysterese: %.1f °C\n", heater_hysteresis);
   
-  heater_mode = preferences.getInt("heater_mode", 0);  // 0=Enabled, 1=Disabled
-  String mode_text = (heater_mode == 0) ? "Enabled" : "Disabled";
-  Serial.printf("Heater Modus: %s\n", mode_text.c_str());
+  heater_mode = preferences.getInt("heater_mode", 0);  // 0=Aktiviert, 1=Deaktiviert
+  String mode_text = (heater_mode == 0) ? "Aktiviert" : "Deaktiviert";
+  Serial.printf("Heizungs-Modus: %s\n", mode_text.c_str());
   
   // Riegelüberwachung (Reed2)
-  reed2_enabled = preferences.getBool("reed2_enabled", true);  // Default: activeiert
-  Serial.printf("Riegelüberwachung (Reed2): %s\n", reed2_enabled ? "Enabled" : "Disabled");
+  reed2_enabled = preferences.getBool("reed2_enabled", true);  // Standard: aktiviert
+  Serial.printf("Riegelüberwachung (Reed2): %s\n", reed2_enabled ? "Aktiviert" : "Deaktiviert");
   
   scheduler_enabled = preferences.getBool("sched_en", false);
   schedule_open_hour = preferences.getInt("sched_oh", 20);
   schedule_open_min = preferences.getInt("sched_om", 0);
   schedule_close_hour = preferences.getInt("sched_ch", 3);
   schedule_close_min = preferences.getInt("sched_cm", 0);
-  Serial.printf("Scheduler: %s (Open: %02d:%02d, Close: %02d:%02d)\n", 
+  Serial.printf("Zeitplaner: %s (Öffnen: %02d:%02d, Schließen: %02d:%02d)\n", 
                 scheduler_enabled ? "AN" : "AUS",
                 schedule_open_hour, schedule_open_min,
                 schedule_close_hour, schedule_close_min);
@@ -3340,13 +3350,13 @@ void setup() {
                 servo1_pos1, servo1_pos2, 
                 servo2_pos1, servo2_pos2, servo2_pos3,
                 servo3_pos1, servo3_pos2);
-  Serial.printf("Timezone: UTC%+d\n", timezone_offset);
+  Serial.printf("Zeitzone: UTC%+d\n", timezone_offset);
   
   // Seestar IP laden
   seestar_ip = preferences.getString("seestar_ip", "192.168.1.100");
   Serial.printf("Seestar S50 IP: %s\n", seestar_ip.c_str());
   
-  preferences.end();  // WICHTIG: Preferences schließen nach dem Load!
+  preferences.end();  // WICHTIG: Preferences schließen nach dem Laden!
   
   // Servos auf Position fahren
   servo1.write(servo1_pos);
@@ -3358,7 +3368,7 @@ void setup() {
   
   WiFiManager wifiManager;
   
-  // Callback nach WiFi-Save
+  // Callback nach WiFi-Speichern
   wifiManager.setSaveConfigCallback([](){
     Serial.println("");
     Serial.println("===============================================");
@@ -3379,7 +3389,7 @@ void setup() {
   // AP-Name und Passwort
   wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   
-  // Versuche zu verbinden, when fehlschlägt → Config Portal
+  // Versuche zu verbinden, wenn fehlschlägt → Config Portal
   Serial.println("Versuche WiFi-Verbindung...");
   if (!wifiManager.autoConnect("S50-Setup")) {
     Serial.println("✗ Verbindung fehlgeschlagen - Neustart");
@@ -3442,14 +3452,14 @@ void setup() {
       
       seestar_ip = new_ip;
       
-      Serial.printf("Seestar IP saved: %s\n", new_ip.c_str());
+      Serial.printf("Seestar IP gespeichert: %s\n", new_ip.c_str());
       
       AsyncWebServerResponse *response = request->beginResponse(200, "text/plain; charset=utf-8", 
-        "Seestar IP saved!\n\n" + new_ip);
+        "Seestar IP gespeichert!\n\n" + new_ip);
       response->addHeader("Connection", "close");
       request->send(response);
     } else {
-      request->send(400, "text/plain; charset=utf-8", "Error: IP fehlt");
+      request->send(400, "text/plain; charset=utf-8", "Fehler: IP fehlt");
     }
   });
   
@@ -3458,35 +3468,26 @@ void setup() {
     request->send_P(200, "text/html; charset=UTF-8", seestar_html);
   });
   
-  // Rain-Seite
+  // Regen-Seite
   server.on("/rain", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html; charset=UTF-8", rain_html);
   });
   
-  // Rain threshold speichern
-  server.on("/rain/threshold", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (request->hasParam("value")) {
-      float val = request->getParam("value")->value().toFloat();
-      if (val >= 0.1 && val <= 10.0) {
-        preferences.begin("s50-enclosure", false);
-        preferences.putFloat("rain_thresh", val);
-        preferences.end();
-        rain_threshold = val;  // Sofort active
-        request->send(200, "text/plain", "Schwellwert saved: " + String(val, 1) + " mm/h");
-      } else {
-        request->send(400, "text/plain", "Invalider Wert!");
-      }
-    } else {
-      request->send(400, "text/plain", "Kein Wert angegeben!");
-    }
+  // Regen-Schwellwert speichern
+  // Regen-Akkumulation zurücksetzen
+  server.on("/rain/reset", HTTP_GET, [](AsyncWebServerRequest *request){
+    rain_acc = 0.0;
+    
+    Serial.println("✓ Regen-Akkumulation manuell zurückgesetzt");
+    request->send(200, "text/plain", "Akkumulation zurückgesetzt");
   });
   
-  // Heater Seite
+  // Heizungs-Seite
   server.on("/heater", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html; charset=UTF-8", heater_html);
   });
   
-  // Heater Hysteresis speichern
+  // Heizungs-Hysterese speichern
   server.on("/heater/hysteresis", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("value")) {
       float val = request->getParam("value")->value().toFloat();
@@ -3494,17 +3495,17 @@ void setup() {
         preferences.begin("s50-enclosure", false);
         preferences.putFloat("heater_hyst", val);
         preferences.end();
-        heater_hysteresis = val;  // Sofort active
-        request->send(200, "text/plain", "Hysteresis saved: " + String(val, 1) + " °C");
+        heater_hysteresis = val;  // Sofort aktiv
+        request->send(200, "text/plain", "Hysterese gespeichert: " + String(val, 1) + " °C");
       } else {
-        request->send(400, "text/plain", "Invalider Wert!");
+        request->send(400, "text/plain", "Ungültiger Wert!");
       }
     } else {
       request->send(400, "text/plain", "Kein Wert angegeben!");
     }
   });
   
-  // Heater Modus setzen
+  // Heizungs-Modus setzen
   server.on("/heater/mode", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("mode")) {
       int mode = request->getParam("mode")->value().toInt();
@@ -3514,11 +3515,11 @@ void setup() {
         preferences.end();
         heater_mode = mode;
         
-        String mode_text = (mode == 0) ? "Enabled" : "Disabled";
-        Serial.printf("Heater Modus: %s\n", mode_text.c_str());
-        request->send(200, "text/plain; charset=utf-8", "Heater: " + mode_text);
+        String mode_text = (mode == 0) ? "Aktiviert" : "Deaktiviert";
+        Serial.printf("Heizungs-Modus: %s\n", mode_text.c_str());
+        request->send(200, "text/plain; charset=utf-8", "Heizung: " + mode_text);
       } else {
-        request->send(400, "text/plain", "Invalider Modus!");
+        request->send(400, "text/plain", "Ungültiger Modus!");
       }
     } else {
       request->send(400, "text/plain", "Kein Modus angegeben!");
@@ -3533,18 +3534,18 @@ void setup() {
     preferences.putBool("reed2_enabled", reed2_enabled);
     preferences.end();
     
-    Serial.printf("Riegelüberwachung (Reed2): %s\n", reed2_enabled ? "Enabled" : "Disabled");
-    request->send(200, "text/plain; charset=utf-8", reed2_enabled ? "Enabled" : "Disabled");
+    Serial.printf("Riegelüberwachung (Reed2): %s\n", reed2_enabled ? "Aktiviert" : "Deaktiviert");
+    request->send(200, "text/plain; charset=utf-8", reed2_enabled ? "Aktiviert" : "Deaktiviert");
   });
   
-  // Scheduler-Seite
+  // Zeitplaner-Seite
   // TEST-Route
   server.on("/test", HTTP_GET, [](AsyncWebServerRequest *request){
     Serial.println("=== TEST ROUTE FUNKTIONIERT! ===");
     request->send(200, "text/plain", "PONG");
   });
   
-  // Scheduler speichern (MUSS VOR /scheduler stehen!)
+  // Zeitplaner speichern (MUSS VOR /scheduler stehen!)
   server.on("/scheduler/save", HTTP_GET, [](AsyncWebServerRequest *request){
     Serial.println("=== /scheduler/save aufgerufen ===");
     Serial.println("=== ROUTE FUNKTIONIERT! ===");
@@ -3572,19 +3573,19 @@ void setup() {
         preferences.putInt("sched_ch", ch);
         preferences.putInt("sched_cm", cm);
         preferences.end();
-        Serial.println("Preferences saved!");
+        Serial.println("Preferences gespeichert!");
         
-        // Sofort active
+        // Sofort aktiv
         scheduler_enabled = enabled;
         schedule_open_hour = oh;
         schedule_open_min = om;
         schedule_close_hour = ch;
         schedule_close_min = cm;
         
-        Serial.println("=== Scheduler saved ===");
+        Serial.println("=== Zeitplaner gespeichert ===");
         Serial.printf("Enabled: %s\n", enabled ? "JA" : "NEIN");
-        Serial.printf("Open: %02d:%02d\n", oh, om);
-        Serial.printf("Close: %02d:%02d\n", ch, cm);
+        Serial.printf("Öffnen: %02d:%02d\n", oh, om);
+        Serial.printf("Schließen: %02d:%02d\n", ch, cm);
         Serial.printf("Globale Variablen: enabled=%d, open=%d:%d, close=%d:%d\n",
                       scheduler_enabled, schedule_open_hour, schedule_open_min,
                       schedule_close_hour, schedule_close_min);
@@ -3593,11 +3594,11 @@ void setup() {
         response->addHeader("Connection", "close");
         request->send(response);
       } else {
-        Serial.println("ERROR: Invalide Timeangabe!");
-        request->send(400, "text/plain; charset=utf-8", "Invalide Timeangabe!");
+        Serial.println("FEHLER: Ungültige Zeitangabe!");
+        request->send(400, "text/plain; charset=utf-8", "Ungültige Zeitangabe!");
       }
     } else {
-      Serial.println("ERROR: Parameter fehlen!");
+      Serial.println("FEHLER: Parameter fehlen!");
       request->send(400, "text/plain; charset=utf-8", "Parameter fehlen!");
     }
   });
@@ -3611,20 +3612,20 @@ void setup() {
     // Reed-Status lesen (immer schnell)
     readReedContacts();
     
-    // Rain Sensor lesen (falls vorhanden)
+    // Regensensor lesen (falls vorhanden)
     readRainSensor();
     
-    // Weather Data lesen (alle 500ms, da LEDs sonst zu langsam)
+    // Wetterdaten lesen (alle 500ms, da LEDs sonst zu langsam)
     temp_innen = sht21_innen.readTemperature();
     delay(50);
     hum_innen = sht21_innen.readHumidity();
     delay(50);
     
-    // Humidity auf 1-100% begrenzen (Sensor-Fehler abfangen)
+    // Luftfeuchtigkeit auf 1-100% begrenzen (Sensor-Fehler abfangen)
     if (hum_innen < 1.0) hum_innen = 1.0;
     if (hum_innen > 100.0) hum_innen = 100.0;
     
-    // BMP180/BMP280 nur auslesen if present
+    // BMP180/BMP280 nur auslesen wenn vorhanden
     if (isBMPPresent()) {
       temp_aussen = readBMPTemperature();
       delay(20);
@@ -3635,7 +3636,7 @@ void setup() {
       druck_aussen = 0.0;
     }
     
-    // RTC Time mit millis() hochzählen
+    // RTC Zeit mit millis() hochzählen
     updateRTCTime();
     
     // GPS Daten
@@ -3658,7 +3659,7 @@ void setup() {
       gps_date = "--.--.----";
     }
     
-    // enclosure-Status berechnen
+    // Gehäuse-Status berechnen
     updateStatusText();
     String status_detail = getStatusDetail();
     
@@ -3686,10 +3687,7 @@ void setup() {
     json += "\"gps_fix\":" + String(gps_fix ? "true" : "false") + ",";
     json += "\"rain_sensor_present\":" + String(rain_sensor_present ? "true" : "false") + ",";
     json += "\"rain_detected\":" + String(rain_detected ? "true" : "false") + ",";
-    json += "\"rain_rate\":" + String(rain_rate, 2) + ",";
     json += "\"rain_acc\":" + String(rain_acc, 2) + ",";
-    json += "\"rain_intensity\":" + String(rain_intensity) + ",";
-    json += "\"rain_threshold\":" + String(rain_threshold, 1) + ",";
     json += "\"heater_on\":" + String(heater_on ? "true" : "false") + ",";
     json += "\"heater_mode\":" + String(heater_mode) + ",";
     json += "\"dew_point\":" + String(dew_point, 1) + ",";
@@ -3742,13 +3740,13 @@ void setup() {
       
       if (cmd == "open") {
         pending_action = OPEN;
-        Serial.println(">>> Open-Aktion geplant");
-        request->send(200, "text/plain", "Open gestartet...");
+        Serial.println(">>> Öffnen-Aktion geplant");
+        request->send(200, "text/plain", "Öffnen gestartet...");
         
       } else if (cmd == "close") {
         pending_action = CLOSE;
-        Serial.println(">>> Close-Aktion geplant");
-        request->send(200, "text/plain", "Close gestartet...");
+        Serial.println(">>> Schließen-Aktion geplant");
+        request->send(200, "text/plain", "Schließen gestartet...");
         
       } else if (cmd == "toggle") {
         pending_action = TOGGLE_S50;
@@ -3788,11 +3786,11 @@ void setup() {
       
       request->send(200, "text/plain", "OK");
     } else {
-      request->send(400, "text/plain", "Error: Parameter fehlen");
+      request->send(400, "text/plain", "Fehler: Parameter fehlen");
     }
   });
   
-  // Goto savede Position
+  // Goto gespeicherte Position
   server.on("/goto", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("servo") && request->hasParam("pos")) {
       int servo_id = request->getParam("servo")->value().toInt();
@@ -3825,7 +3823,7 @@ void setup() {
       
       request->send(200, "text/plain", "OK");
     } else {
-      request->send(400, "text/plain", "Error: Parameter fehlen");
+      request->send(400, "text/plain", "Fehler: Parameter fehlen");
     }
   });
   
@@ -3843,11 +3841,11 @@ void setup() {
         if (pos_num == 1) {
           servo1_pos1 = servo1_pos;
           preferences.putInt("s1_pos1", servo1_pos1);
-          msg = "Servo 1 Pos1 saved: " + String(servo1_pos1) + "°";
+          msg = "Servo 1 Pos1 gespeichert: " + String(servo1_pos1) + "°";
         } else {
           servo1_pos2 = servo1_pos;
           preferences.putInt("s1_pos2", servo1_pos2);
-          msg = "Servo 1 Pos2 saved: " + String(servo1_pos2) + "°";
+          msg = "Servo 1 Pos2 gespeichert: " + String(servo1_pos2) + "°";
         }
         
       } else if (servo_id == 2) {
@@ -3855,26 +3853,26 @@ void setup() {
         if (pos_num == 1) {
           servo2_pos1 = servo2_pos;
           preferences.putInt("s2_pos1", servo2_pos1);
-          msg = "Servo 2 Pos1 (geschlossen) saved: " + String(servo2_pos1) + "°";
+          msg = "Servo 2 Pos1 (geschlossen) gespeichert: " + String(servo2_pos1) + "°";
         } else if (pos_num == 2) {
           servo2_pos2 = servo2_pos;
           preferences.putInt("s2_pos2", servo2_pos2);
-          msg = "Servo 2 Pos2 (offen) saved: " + String(servo2_pos2) + "°";
+          msg = "Servo 2 Pos2 (offen) gespeichert: " + String(servo2_pos2) + "°";
         } else if (pos_num == 3) {
           servo2_pos3 = servo2_pos;
           preferences.putInt("s2_pos3", servo2_pos3);
-          msg = "Servo 2 Pos3 (halboffen) saved: " + String(servo2_pos3) + "°";
+          msg = "Servo 2 Pos3 (halboffen) gespeichert: " + String(servo2_pos3) + "°";
         }
         
       } else if (servo_id == 3) {
         if (pos_num == 1) {
           servo3_pos1 = servo3_pos;
           preferences.putInt("s3_pos1", servo3_pos1);
-          msg = "Servo 3 Pos1 saved: " + String(servo3_pos1) + "°";
+          msg = "Servo 3 Pos1 gespeichert: " + String(servo3_pos1) + "°";
         } else {
           servo3_pos2 = servo3_pos;
           preferences.putInt("s3_pos2", servo3_pos2);
-          msg = "Servo 3 Pos2 saved: " + String(servo3_pos2) + "°";
+          msg = "Servo 3 Pos2 gespeichert: " + String(servo3_pos2) + "°";
         }
       }
       
@@ -3886,11 +3884,11 @@ void setup() {
       response->addHeader("Connection", "close");
       request->send(response);
     } else {
-      request->send(400, "text/plain; charset=utf-8", "Error: Parameter fehlen");
+      request->send(400, "text/plain; charset=utf-8", "Fehler: Parameter fehlen");
     }
   });
   
-  // Timezone anpassen
+  // Zeitzone anpassen
   server.on("/timezone", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("delta")) {
       int delta = request->getParam("delta")->value().toInt();
@@ -3900,14 +3898,14 @@ void setup() {
       preferences.putInt("timezone", timezone_offset);
       preferences.end();
       
-      String msg = "Timezone: UTC" + String(timezone_offset >= 0 ? "+" : "") + String(timezone_offset);
+      String msg = "Zeitzone: UTC" + String(timezone_offset >= 0 ? "+" : "") + String(timezone_offset);
       Serial.println(msg);
       
       AsyncWebServerResponse *response = request->beginResponse(200, "text/plain; charset=utf-8", msg);
       response->addHeader("Connection", "close");
       request->send(response);
     } else {
-      request->send(400, "text/plain; charset=utf-8", "Error: Parameter fehlen");
+      request->send(400, "text/plain; charset=utf-8", "Fehler: Parameter fehlen");
     }
   });
   
@@ -3915,11 +3913,11 @@ void setup() {
   
   // WiFi Save & Reboot
   
-  // System Load Defaults (nur Servo Positions zurücksetzen)
+  // System Load Defaults (nur Servo-Positionen zurücksetzen)
   server.on("/system/defaults", HTTP_GET, [](AsyncWebServerRequest *request){
     Serial.println("=== LOAD DEFAULTS ===");
     
-    // Setze alle Servo Positions auf 90°
+    // Setze alle Servo-Positionen auf 90°
     servo1_pos = 90;
     servo2_pos = 90;
     servo3_pos = 90;
@@ -3952,7 +3950,7 @@ void setup() {
     servo3.write(90);
     
     Serial.println("Alle Servo-Winkel auf 90° zurückgesetzt");
-    Serial.println("WiFi und Timezone bleiben erhalten");
+    Serial.println("WiFi und Zeitzone bleiben erhalten");
     
     AsyncWebServerResponse *response = request->beginResponse(200, "text/plain; charset=utf-8", "OK");
     response->addHeader("Connection", "close");
@@ -4001,7 +3999,7 @@ void setup() {
   // Server starten
   server.begin();
   Serial.println("Webserver gestartet!");
-  Serial.println("OTA Update activeiert auf http://" + WiFi.localIP().toString() + "/update");
+  Serial.println("OTA Update aktiviert auf http://" + WiFi.localIP().toString() + "/update");
   Serial.println("Öffne http://" + WiFi.localIP().toString());
 }
 
@@ -4018,9 +4016,9 @@ void loop() {
         {
           bool success = openDome();
           if (success) {
-            Serial.println("✓ Open erfolgreich");
+            Serial.println("✓ Öffnen erfolgreich");
           } else {
-            Serial.println("✗ Open fehlgeschlagen");
+            Serial.println("✗ Öffnen fehlgeschlagen");
           }
         }
         break;
@@ -4029,9 +4027,9 @@ void loop() {
         {
           bool success = closeDome();
           if (success) {
-            Serial.println("✓ Close erfolgreich");
+            Serial.println("✓ Schließen erfolgreich");
           } else {
-            Serial.println("⚠ Nur half-open (Tube not retracted)");
+            Serial.println("⚠ Nur halboffen (Tubus nicht eingefahren)");
           }
         }
         break;
@@ -4046,24 +4044,24 @@ void loop() {
     }
   }
   
-  // Tube-Überwachung: Automatics Halböffnen when Tube ausfährt
-  // ABER NUR when enclosure CLOSED ist!
+  // Tubus-Überwachung: Automatisches Halböffnen wenn Tubus ausfährt
+  // ABER NUR wenn Gehäuse GESCHLOSSEN ist!
   static bool last_tubus_standby = true;  // Startzustand
   readReedContacts();
   
-  // Erkenne Übergang: Standby → Aktiv (Tube fährt aus)
+  // Erkenne Übergang: Standby → Aktiv (Tubus fährt aus)
   if (last_tubus_standby && !reed3_state) {
-    // Nur auf half-open fahren when Cover CLOSED ist (nicht bei open!)
+    // Nur auf halboffen fahren wenn Klappe GESCHLOSSEN ist (nicht bei offen!)
     if (servo2_pos == servo2_pos1) {
-      Serial.println("⚠️ TUBUS FÄHRT OFF! Öffne Cover automatisch auf HALF-OPEN...");
+      Serial.println("⚠️ TUBUS FÄHRT AUS! Öffne Klappe automatisch auf HALBOFFEN...");
       moveServoSlow(servo2, servo2_pos, servo2_pos3);
       servo2_pos = servo2_pos3;
       preferences.begin("s50-enclosure", false);
       preferences.putInt("servo2", servo2_pos);
       preferences.end();
-      Serial.println("✓ Cover auf HALF-OPEN (Sicherheit)");
+      Serial.println("✓ Klappe auf HALBOFFEN (Sicherheit)");
     } else {
-      Serial.println("⚠️ TUBUS FÄHRT OFF, aber Cover ist bereits open → keine Änderung");
+      Serial.println("⚠️ TUBUS FÄHRT AUS, aber Klappe ist bereits offen → keine Änderung");
     }
   }
   
@@ -4074,7 +4072,7 @@ void loop() {
     gps.encode(gpsSerial.read());
   }
   
-  // GPS -> RTC Sync (alle 10 Minuten when Fix vorhanden)
+  // GPS -> RTC Sync (alle 10 Minuten wenn Fix vorhanden)
   if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid()) {
     if (millis() - last_gps_sync > GPS_SYNC_INTERVAL || last_gps_sync == 0) {
       syncRTCwithGPS();
@@ -4082,55 +4080,58 @@ void loop() {
     }
   }
   
-  // Heater Steuerung (alle 10 seconds prüfen)
+  // Heizungs-Steuerung (alle 10 Sekunden prüfen)
   static unsigned long last_heater_check = 0;
   if (millis() - last_heater_check > 10000 || last_heater_check == 0) {
     controlHeater();
     last_heater_check = millis();
   }
   
-  // Scheduler prüfen (jede Minute)
+  // Zeitplaner prüfen (jede Minute)
   static unsigned long last_scheduler_check = 0;
   if (millis() - last_scheduler_check > 60000 || last_scheduler_check == 0) {
     checkScheduler();
     last_scheduler_check = millis();
   }
   
-  // WiFi Signal-Stärke aktualisieren (alle 5 seconds)
+  // WiFi Signal-Stärke aktualisieren (alle 5 Sekunden)
   static unsigned long last_wifi_update = 0;
   if (!apMode && (millis() - last_wifi_update > 5000 || last_wifi_update == 0)) {
     wifi_rssi = WiFi.RSSI();
     last_wifi_update = millis();
   }
   
-  // Seestar S50 Ping Check (alle 5 seconds)
+  // Seestar S50 Ping Check (alle 5 Sekunden)
   if (!apMode && (millis() - last_ping_check > 5000 || last_ping_check == 0)) {
     checkSeestarOnline();
     last_ping_check = millis();
   }
   
-  // Rain Sensor prüfen und ggf. Emergency close (alle 10s)
+  // Regensensor kontinuierlich auslesen (nicht-blockierend)
   if (rain_sensor_present) {
+    readRainSensor();  // Verarbeitet alle verfügbaren Frames
+    
     static unsigned long last_rain_check = 0;
-    
-    if (millis() - last_rain_check >= 10000) {
-      last_rain_check = millis();
-      readRainSensor();
-    }
-    
     static bool rain_emergency_triggered = false;
     
-    if (rain_detected && !rain_emergency_triggered) {
-      Serial.println("⚠️ REGEN ERKANNT! Starte Emergency close...");
-      emergencyRainClose();
-      rain_emergency_triggered = true;
-      // last_rain_close wird in emergencyRainClose() gesetzt
-      // last_error_message wird nur bei Fehler gesetzt
-    }
-    
-    if (!rain_detected && rain_emergency_triggered) {
-      rain_emergency_triggered = false;  // Reset when wieder trocken
-      // Meldung bleibt bestehen zur Info
+    // Prüfe Regensensor alle 10s
+    if (millis() - last_rain_check >= 10000) {
+      last_rain_check = millis();
+      
+      // Wenn Sensor Regen meldet (Acc > 0) → sofort schließen
+      if (rain_detected && !rain_emergency_triggered) {
+        Serial.printf("⚠️ REGEN ERKANNT! (Acc=%.2f) Starte Notschließung...\n", rain_acc);
+        emergencyRainClose();
+        rain_emergency_triggered = true;
+        // last_rain_close wird in emergencyRainClose() gesetzt
+        // last_error_message wird nur bei Fehler gesetzt
+      }
+      
+      // Wenn wieder trocken → Reset
+      if (!rain_detected && rain_emergency_triggered) {
+        rain_emergency_triggered = false;
+        Serial.println("✓ Sensor meldet wieder TROCKEN");
+      }
     }
   }
   
